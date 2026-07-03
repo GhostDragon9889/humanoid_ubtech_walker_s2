@@ -64,6 +64,7 @@ fi
 exec "${ISAAC_PYTHON[@]}" -m lerobot.scripts.lerobot_teleoperate \
   --robot.type=walker_s2_sim \
   --robot.headless=false \
+  --robot.enable_sim_cameras=false \
   --teleop.type=walker_s2_keyboard \
   --task=Part_Sorting \
   --display_data=false \

@@ -1,6 +1,8 @@
 root_path: "../../assets/resources/"
 
-scene_usd: 'Collected_Task4/SubUSDs/2_small_warehouse2.usd'
+# Minimal calibration stage. The table, part, and robot are added below by
+# SceneBuilder, so the textured warehouse is unnecessary for grasp testing.
+scene_usd: '../minimal_grasp_scene.usda'
 
 timelimit: 100
 
@@ -16,12 +18,15 @@ part:
     - "Collected_Part_B_blue/Part_B.usd"
     - "Collected_Part_B_ori_color/Part_B.usd"
   num_parts: 2  # fallback, used when num_parts_a / num_parts_b not set
-  num_parts_a: 2  # Part A quantity (overrides num_parts)
-  num_parts_b: 2  # Part B quantity (overrides num_parts)
-  scatter_min_distance: 0.11  
-  scatter_edge_margin_x: 0.025
-  scatter_edge_margin_y: 0.025
-  spawn_z_offset: 0.0
+  # Calibration mode: use fewer, larger objects so grasp-frame errors are visible
+  # without making every attempt fail on tiny contact margins.
+  num_parts_a: 1  # Part A quantity (overrides num_parts)
+  num_parts_b: 0  # Part B quantity (overrides num_parts)
+  scale: [2.0, 2.0, 2.0]
+  scatter_min_distance: 0.18
+  scatter_edge_margin_x: 0.045
+  scatter_edge_margin_y: 0.045
+  spawn_z_offset: 0.04
 
 plane:
   plane_position: 
@@ -35,14 +40,6 @@ table:
   - [0.75, 0.3, 0.5]
   table_scale: 
   - [1.9927, 1.8738, 1.1109]
-
-box:
-  box_usd: 'Box_blank/box_60_40_23_cut_0.usd'
-  box_position: 
-  - [1.2, 0.3, 1.05]
-  box_scale: 
-  - [0.38, 0.75, 0.36]
-  lock_boxes: true   # 禁止物理引擎移动箱子，保持固定位置
 
 robot:
   # Official merged body + UBT hand v3 (relative to repo root zollent_technology/)
@@ -63,7 +60,7 @@ robot:
 
 grasp:
   target_index: 0
-  hand_pose: pinch
+  hand_pose: power
   # Each grasp type has its own pre-shape and contact center. These are initial
   # geometry-based values and can be calibrated independently from test images.
   profiles:
@@ -79,7 +76,7 @@ grasp:
       preshape_pose: power_pre
       palm_tcp_offset: [0.065, 0.0, 0.035]
       palm_tcp_lateral_offset: 0.0
-  pregrasp_distance: 0.12
+  pregrasp_distance: 0.08
   approach_direction: vertical
   grasp_frame: palm
   # Thumb-index pinch center in palm_link coordinates: forward, lateral,
@@ -89,7 +86,7 @@ grasp:
   palm_tcp_offset: [0.055, 0.0, 0.04]
   palm_tcp_lateral_offset: 0.028
   mirror_palm_tcp_lateral: true
-  grasp_height_offset: 0.025
+  grasp_height_offset: 0.005
   max_grasp_distance: 0.85
   workspace_x: [0.15, 0.85]
   workspace_y: [-0.65, 0.65]
@@ -97,7 +94,7 @@ grasp:
   lift_height: 0.17
   approach_time: 3.0
   preshape_time: 0.8
-  reach_time: 2.0
+  reach_time: 3.0
   close_time: 1.0
   settle_time: 1.0
   lift_time: 2.0
@@ -112,4 +109,4 @@ grasp:
   waypoint_timeout: 2.5
   scatter_area:
     center: [0.75, 0.28, 1.04]   # 散布中心 [x, y, z]
-    size:   [0.30, 0.23]         # 散布半宽 x方向, y方向 (m)  →  x:[0.50,0.80] y:[0.10,0.30]
+    size:   [0.36, 0.26]         # 散布半宽 x方向, y方向 (m)  →  x:[0.57,0.93] y:[0.15,0.41]

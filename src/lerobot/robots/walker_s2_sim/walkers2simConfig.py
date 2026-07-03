@@ -87,11 +87,14 @@ class WalkerS2Config(RobotConfig):
     sim_height: int = 720
     physics_dt: float = 1.0 / 200.0
     rendering_dt: float = 1.0 / 20.0
+    # Isaac sensor cameras allocate separate RTX render products. They are useful
+    # for recording, but keyboard-only teleop can disable them to conserve VRAM.
+    enable_sim_cameras: bool = True
 
     # 控制设置
     # 键盘控制的速度级别 (rad/step)
-    speed_levels: list[float] = field(default_factory=lambda: [0.010, 0.035, 0.15, 0.25])
-    default_speed_index: int = 1  
+    speed_levels: list[float] = field(default_factory=lambda: [0.003, 0.008, 0.020, 0.050])
+    default_speed_index: int = 0
     tracking_interp_steps: int = 100
 
 

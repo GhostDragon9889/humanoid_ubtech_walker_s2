@@ -370,6 +370,7 @@ class IsaacSimRobotInterface:
         urdf_path: Optional[str] = None,
         use_explicit_standing_body: bool = False,
         arm_control_cfg: Optional[dict[str, Any]] = None,
+        enable_cameras: bool = True,
     ):
         self.prim_path = prim_path
         self.name = name
@@ -378,6 +379,7 @@ class IsaacSimRobotInterface:
         self.time = 0.0
         self.urdf_path = urdf_path
         self.use_explicit_standing_body = use_explicit_standing_body
+        self.enable_cameras = bool(enable_cameras)
         arm_control_cfg = arm_control_cfg or {}
         self.arm_control_mode = str(arm_control_cfg.get("mode", "kinematic")).lower()
         if self.arm_control_mode not in ("physical", "kinematic"):
@@ -546,11 +548,41 @@ class IsaacSimRobotInterface:
 
     def prepare_dexterous_hand_for_arm_motion(self, side: str) -> None:
         if self.dexterous_hand_active_pose.get(side) in ("open", "travel"):
-            self.snap_dexterous_hand_pose(side, "travel")
+            self.snap_dexterous_hand_pose(side, "open")
 
     def close_dexterous_hand(self, side: str, pose_name: Optional[str] = None) -> None:
         pose = pose_name or self.dexterous_hand_close_pose.get(side, "power")
         self.set_dexterous_hand_pose(side, pose)
+
+    def nudge_dexterous_hand(
+        self,
+        side: str,
+        direction: float,
+        pose_name: Optional[str] = None,
+        fraction_step: float = 0.08,
+    ) -> None:
+        if side not in ("L", "R"):
+            return
+        if not self.dexterous_hand_joint_indices.get(side):
+            return
+
+        close_pose = pose_name or self.dexterous_hand_close_pose.get(side, "power")
+        open_values = np.asarray(self._pose_values_for_side(side, "open"), dtype=np.float32)
+        close_values = np.asarray(self._pose_values_for_side(side, close_pose), dtype=np.float32)
+        raw_target = self.dexterous_hand_target_positions.get(side)
+        target = np.asarray(
+            open_values if raw_target is None else raw_target, dtype=np.float32
+        )
+        if target.shape != open_values.shape:
+            target = open_values.copy()
+
+        delta = float(np.sign(direction)) * float(fraction_step) * (close_values - open_values)
+        lo = np.minimum(open_values, close_values)
+        hi = np.maximum(open_values, close_values)
+        next_target = np.clip(target + delta, lo, hi)
+        self.dexterous_hand_target_positions[side] = next_target.astype(np.float32).tolist()
+        self.dexterous_hand_active_pose[side] = "manual"
+        self.dexterous_hand_close_pose[side] = close_pose
 
     def preshape_dexterous_hand(self, side: str, pose_name: str) -> None:
         preshape = f"{pose_name}_pre"
@@ -993,6 +1025,10 @@ class IsaacSimRobotInterface:
 
     def _setup_cameras(self):
         """Setup cameras."""
+        if not self.enable_cameras:
+            logger.info("Isaac sensor cameras disabled; using the main viewport only")
+            return
+
         from isaacsim.sensors.camera import Camera
 
         if Camera is None:

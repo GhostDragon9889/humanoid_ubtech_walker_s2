@@ -553,7 +553,7 @@ class WalkerS2sim(Robot):
         lift_pose[:3] -= approach_direction * float(active_grasp_cfg.get("lift_height", 0.17))
 
         side = "L" if arm == "left" else "R"
-        self._robot_interface.snap_dexterous_hand_pose(side, "travel")
+        self._robot_interface.snap_dexterous_hand_pose(side, "open")
         self._reset_teleop_ee_targets()
         self._go_home = False
         self._assisted_grasp = {
@@ -614,19 +614,14 @@ class WalkerS2sim(Robot):
         duration = state["durations"][phase]
         state["phase_elapsed"] += max(float(step_size), 0.0)
 
-        if phase == "pregrasp":
-            goal = state["pregrasp"]
-        elif phase in ("preshape", "reach", "close", "settle"):
-            goal = state["grasp"]
-        else:
-            goal = state["lift"]
+        if phase != "pregrasp":
+            self._cancel_assisted_grasp(f"unexpected assisted grasp phase: {phase}")
+            return
 
-        if phase in ("preshape", "close", "settle"):
-            target = goal
-        else:
-            target = self._interpolate_pose(
-                state["phase_start"], goal, state["phase_elapsed"] / duration
-            )
+        goal = state["pregrasp"]
+        target = self._interpolate_pose(
+            state["phase_start"], goal, state["phase_elapsed"] / duration
+        )
 
         arm = state["arm"]
         ik_result = self._robot_interface.control_dual_arm_ik(
@@ -644,58 +639,26 @@ class WalkerS2sim(Robot):
         if state["phase_elapsed"] < duration:
             return
 
-        if phase in ("pregrasp", "reach", "lift"):
-            ee_poses = self._robot_interface.get_ee_poses()
-            if ee_poses is None:
-                self._cancel_assisted_grasp("end-effector feedback unavailable")
+        ee_poses = self._robot_interface.get_ee_poses()
+        if ee_poses is None:
+            self._cancel_assisted_grasp("end-effector feedback unavailable")
+            return
+        position_error = float(np.linalg.norm(ee_poses[arm][:3] - goal[:3]))
+        if position_error > state["waypoint_tolerance"]:
+            if state["phase_elapsed"] < duration + state["waypoint_timeout"]:
                 return
-            position_error = float(np.linalg.norm(ee_poses[arm][:3] - goal[:3]))
-            if position_error > state["waypoint_tolerance"]:
-                if state["phase_elapsed"] < duration + state["waypoint_timeout"]:
-                    return
-                if phase in ("pregrasp", "reach"):
-                    self._cancel_assisted_grasp(
-                        f"{phase} waypoint missed by {position_error:.3f} m"
-                    )
-                    return
-                logger.warning(
-                    "[assisted_grasp] Lift ended %.3f m from its waypoint",
-                    position_error,
-                )
-
-        next_phase = {
-            "pregrasp": "preshape",
-            "preshape": "reach",
-            "reach": "close",
-            "close": "settle",
-            "settle": "lift",
-            "lift": "done",
-        }[phase]
-        if next_phase == "done":
-            logger.info(
-                "[assisted_grasp] Complete target=%s arm=%s",
-                state["target_path"],
-                arm,
+            self._cancel_assisted_grasp(
+                f"pregrasp waypoint missed by {position_error:.3f} m"
             )
-            self._assisted_grasp = None
             return
 
-        state["phase"] = next_phase
-        state["phase_elapsed"] = 0.0
-        state["phase_start"] = np.asarray(goal, dtype=float).copy()
-        if next_phase == "preshape":
-            self._robot_interface.set_dexterous_hand_pose(
-                state["side"], state["preshape_pose"]
-            )
-        elif next_phase == "close":
-            self._robot_interface.close_dexterous_hand(
-                state["side"], state["hand_pose"]
-            )
-            if arm == "left":
-                self._left_gripping = True
-            else:
-                self._right_gripping = True
-        logger.info("[assisted_grasp] Phase: %s", next_phase)
+        logger.info(
+            "[assisted_grasp] Reached pregrasp target=%s arm=%s; manual control resumed",
+            state["target_path"],
+            arm,
+        )
+        self._teleop_ee_targets[arm] = np.asarray(goal, dtype=float).copy()
+        self._assisted_grasp = None
 
     def _accumulate_teleop_ee_target(
         self,
@@ -705,9 +668,14 @@ class WalkerS2sim(Robot):
         step_size: float,
     ) -> np.ndarray:
         current = np.asarray(current_pose[:6], dtype=np.float64)
+        base = self._teleop_ee_targets.get(side)
+        if base is None:
+            base = current
+        else:
+            base = np.asarray(base, dtype=np.float64)
 
-        # Match the official baseline keyboard path: target = current EE pose
-        # plus the key delta. Cap only the very large debug speed so IK stays local.
+        # Accumulate from the last commanded EE target. Using measured EE pose
+        # every keypress bakes in arm settling drift and can make all keys sag.
         bounded_delta = np.asarray(delta, dtype=np.float64).copy()
         xyz_norm = float(np.linalg.norm(bounded_delta[:3]))
         if xyz_norm > self._teleop_target_max_xyz_step:
@@ -719,7 +687,7 @@ class WalkerS2sim(Robot):
             self._teleop_target_max_rpy_step,
         )
 
-        target = current + bounded_delta
+        target = base + bounded_delta
         self._teleop_ee_targets[side] = target
         return target.copy()
 
@@ -907,9 +875,13 @@ class WalkerS2sim(Robot):
         self._world.add_physics_callback("robot_control", self._robot_control_callback)
         self._world.add_physics_callback("score_input_record", self._score_input_record_callback)
         self._world.add_physics_callback("foam_sync", self._foam_sync_callback)
-        self._world.add_render_callback("camera_images", self._camera_images_callback)
+        if self.config.enable_sim_cameras:
+            self._world.add_render_callback("camera_images", self._camera_images_callback)
         self._callbacks_registered = True
-        logger.info("Physics/render callbacks registered")
+        logger.info(
+            "Physics callbacks registered%s",
+            " with camera rendering" if self.config.enable_sim_cameras else " without sensor cameras",
+        )
 
     def _unregister_world_callbacks(self) -> None:
         """注销所有回调"""
@@ -1071,6 +1043,9 @@ class WalkerS2sim(Robot):
                             step_size=step_size,
                             left_target_xyzrpy=left_target,
                             right_target_xyzrpy=right_target,
+                            rot_weight=self._teleop_ik_rot_weight,
+                            pos_tol=self._teleop_ik_pos_tol,
+                            rot_tol=self._teleop_ik_rot_tol,
                         )
                         if ik_result and "smoothed_positions" in ik_result:
                             sp = ik_result["smoothed_positions"]
@@ -1103,19 +1078,17 @@ class WalkerS2sim(Robot):
                         self._hold_finger_positions[:2] - left_gripper * gripper_step, g_lo, g_hi
                     )
                     self._left_gripping = left_gripper < 0
-                    if self._left_gripping:
-                        self._robot_interface.close_dexterous_hand("L")
-                    else:
-                        self._robot_interface.open_dexterous_hand("L")
+                    self._robot_interface.nudge_dexterous_hand(
+                        "L", -left_gripper, fraction_step=0.01
+                    )
                 if self._assisted_grasp is None and abs(right_gripper) > 0.01:
                     self._hold_finger_positions[2:4] = np.clip(
                         self._hold_finger_positions[2:4] - right_gripper * gripper_step, g_lo, g_hi
                     )
                     self._right_gripping = right_gripper < 0
-                    if self._right_gripping:
-                        self._robot_interface.close_dexterous_hand("R")
-                    else:
-                        self._robot_interface.open_dexterous_hand("R")
+                    self._robot_interface.nudge_dexterous_hand(
+                        "R", -right_gripper, fraction_step=0.01
+                    )
 
                 pose_name = None
                 if self._assisted_grasp is not None:
@@ -1494,6 +1467,7 @@ class WalkerS2sim(Robot):
             urdf_path=urdf_path,
             use_explicit_standing_body=uses_urdf,
             arm_control_cfg=self.config.task_cfg.get("robot", {}).get("arm_control", {}),
+            enable_cameras=self.config.enable_sim_cameras,
         )
 
         logger.info("初始化 Articulation（物理暂停中）...")

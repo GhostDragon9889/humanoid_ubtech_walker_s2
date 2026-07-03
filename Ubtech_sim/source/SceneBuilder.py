@@ -104,6 +104,28 @@ class SceneBuilder:
             return asset_path
         return self._usd_path(asset_path)
 
+    def _part_scale_for_type(self, part_type):
+        """Return the configured visual/collision scale for a Task1/Task3 part."""
+        default_scale = self.part_cfg.get('scale', [1.0, 1.0, 1.0])
+        type_scales = self.part_cfg.get('scales_by_type', {})
+        raw_scale = type_scales.get(part_type, default_scale) if part_type else default_scale
+
+        if isinstance(raw_scale, (int, float)):
+            scale = np.array([raw_scale, raw_scale, raw_scale], dtype=np.float64)
+        else:
+            scale = np.array(raw_scale, dtype=np.float64).flatten()
+            if scale.size == 1:
+                scale = np.repeat(scale, 3)
+            elif scale.size != 3:
+                raise ValueError(
+                    f"part scale for {part_type or 'default'} must be a scalar or 3 values, "
+                    f"got {raw_scale!r}"
+                )
+
+        if np.any(scale <= 0):
+            raise ValueError(f"part scale for {part_type or 'default'} must be positive, got {scale}")
+        return scale
+
     def _get_task1_part_plan(self):
         """Return validated Task1 part creation plan as (part_type, asset_pool, count)."""
         fallback_count = self.part_cfg.get('num_parts', 2)
@@ -1456,6 +1478,7 @@ class SceneBuilder:
                 idx += 1
 
                 usd_file = self._resolve_asset_path(self._choose_asset_from_pool(pool))
+                part_scale = self._part_scale_for_type(part_type)
 
                 stage_utils.add_reference_to_stage(usd_path=usd_file, prim_path=prim_path)
                 prim = stage.GetPrimAtPath(prim_path)
@@ -1499,6 +1522,13 @@ class SceneBuilder:
                 xformable.AddTranslateOp().Set(pos)
                 xformable.AddOrientOp().Set(
                     Gf.Quatf(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
+                )
+                xformable.AddScaleOp().Set(
+                    Gf.Vec3f(
+                        float(part_scale[0]),
+                        float(part_scale[1]),
+                        float(part_scale[2]),
+                    )
                 )
 
         return created_paths

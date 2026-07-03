@@ -60,7 +60,7 @@ class WalkerS2KeyboardTeleopConfig(TeleoperatorConfig):
     calibration_dir: Path | None = None
 
     # 速度级别列表，与 mobile_manipulator 默认行为保持一致
-    speed_levels: list[float] = field(default_factory=lambda: [0.010, 0.035, 0.15, 0.25])
+    speed_levels: list[float] = field(default_factory=lambda: [0.003, 0.008, 0.020, 0.050])
 
     # 默认速度级别索引（1 表示使用较快速度）
     default_speed_index: int = 0
