@@ -39,6 +39,8 @@ class SceneBuilder:
         self.target_objects = cfg.get('target_objects', [])
         # 存储各物体的prim路径
         self.table_prim_paths = []
+        self.table_root_paths = []
+        self._table_world_bounds = None
         self.box_prim_paths = []
         self.foam_prim_paths = []
         self.parts_prim_paths = []
@@ -90,6 +92,146 @@ class SceneBuilder:
                 print(f"[SceneBuilder] {label}: ensured CollisionAPI on {applied} mesh prims")
         except Exception as exc:
             print(f"[SceneBuilder] {label}: failed to ensure static colliders: {exc}")
+
+    def _physics_material(self, name, cfg):
+        """Create or update a reusable USD physics material."""
+        try:
+            from pxr import UsdGeom, UsdPhysics
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return None
+
+            UsdGeom.Scope.Define(stage, "/Root/PhysicsMaterials")
+            mat_path = f"/Root/PhysicsMaterials/{name}"
+            mat_prim = stage.DefinePrim(mat_path, "Material")
+            mat_api = UsdPhysics.MaterialAPI.Apply(mat_prim)
+            mat_api.CreateStaticFrictionAttr(float(cfg.get("static_friction", 1.8)))
+            mat_api.CreateDynamicFrictionAttr(float(cfg.get("dynamic_friction", 1.4)))
+            mat_api.CreateRestitutionAttr(float(cfg.get("restitution", 0.0)))
+            return mat_prim
+        except Exception as exc:
+            print(f"[SceneBuilder] failed to create physics material {name}: {exc}")
+            return None
+
+    def _bind_physics_material_under_paths(self, root_paths, material_prim, label="physics"):
+        """Bind a physics material to Xform/Mesh prims under one or more roots."""
+        if material_prim is None:
+            return
+        try:
+            from pxr import Usd, UsdGeom, UsdShade
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return
+            if isinstance(root_paths, str):
+                root_paths = [root_paths]
+            material = UsdShade.Material(material_prim)
+            bound = 0
+            for root_path in root_paths:
+                root = stage.GetPrimAtPath(root_path)
+                if not root.IsValid():
+                    continue
+                for prim in Usd.PrimRange(root):
+                    if prim.IsA(UsdGeom.Xform) or prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Cube):
+                        UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+                        bound += 1
+            if bound:
+                print(f"[SceneBuilder] {label}: bound contact material on {bound} prims")
+        except Exception as exc:
+            print(f"[SceneBuilder] {label}: failed to bind contact material: {exc}")
+
+    def _apply_contact_offsets_under_path(self, root_path, cfg, label="collision"):
+        """Apply small contact/rest offsets to collision meshes where PhysX supports them."""
+        try:
+            from pxr import Usd, UsdGeom, UsdPhysics, Sdf
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return
+            root = stage.GetPrimAtPath(root_path)
+            if not root.IsValid():
+                return
+
+            contact_offset = cfg.get("contact_offset", 0.006)
+            rest_offset = cfg.get("rest_offset", 0.0)
+            applied = 0
+            for prim in Usd.PrimRange(root):
+                if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                    continue
+                prim.CreateAttribute(
+                    "physxCollision:contactOffset",
+                    Sdf.ValueTypeNames.Float,
+                ).Set(float(contact_offset))
+                prim.CreateAttribute(
+                    "physxCollision:restOffset",
+                    Sdf.ValueTypeNames.Float,
+                ).Set(float(rest_offset))
+                applied += 1
+            if applied:
+                print(f"[SceneBuilder] {label}: applied contact offsets on {applied} collision meshes")
+        except Exception as exc:
+            print(f"[SceneBuilder] {label}: failed to apply contact offsets: {exc}")
+
+    def _apply_part_contact_physics(self, prim, prim_path):
+        """Tune part contact behavior for manual dexterous grasp attempts."""
+        try:
+            from pxr import Sdf
+
+            contact_cfg = self.part_cfg.get("contact", {})
+            material_prim = self._physics_material("GraspPartContact", contact_cfg)
+            self._bind_physics_material_under_paths(prim_path, material_prim, label="Part")
+            self._apply_contact_offsets_under_path(prim_path, contact_cfg, label="Part")
+
+            damping_cfg = contact_cfg.get("damping", {})
+            linear_damping = float(damping_cfg.get("linear", 0.25))
+            angular_damping = float(damping_cfg.get("angular", 0.50))
+            max_linear_velocity = float(contact_cfg.get("max_linear_velocity", 2.0))
+            max_angular_velocity = float(contact_cfg.get("max_angular_velocity", 8.0))
+
+            prim.CreateAttribute(
+                "physxRigidBody:linearDamping",
+                Sdf.ValueTypeNames.Float,
+            ).Set(linear_damping)
+            prim.CreateAttribute(
+                "physxRigidBody:angularDamping",
+                Sdf.ValueTypeNames.Float,
+            ).Set(angular_damping)
+            prim.CreateAttribute(
+                "physxRigidBody:maxLinearVelocity",
+                Sdf.ValueTypeNames.Float,
+            ).Set(max_linear_velocity)
+            prim.CreateAttribute(
+                "physxRigidBody:maxAngularVelocity",
+                Sdf.ValueTypeNames.Float,
+            ).Set(max_angular_velocity)
+        except Exception as exc:
+            print(f"[SceneBuilder] Part: failed to tune contact physics for {prim_path}: {exc}")
+
+    def _create_simple_block_part(self, stage, prim_path, part_scale):
+        """Create a clean box rigid body for grasp-contact calibration."""
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+        cube = UsdGeom.Cube.Define(stage, prim_path)
+        prim = cube.GetPrim()
+        cube.CreateSizeAttr(1.0)
+        dims = np.asarray(
+            self.part_cfg.get("simple_block_size", [0.055, 0.04, 0.085]),
+            dtype=np.float64,
+        )
+        if dims.size != 3:
+            raise ValueError(f"part.simple_block_size must have 3 values, got {dims}")
+        dims = dims * np.asarray(part_scale, dtype=np.float64)
+        cube.CreateExtentAttr([
+            Gf.Vec3f(-0.5, -0.5, -0.5),
+            Gf.Vec3f(0.5, 0.5, 0.5),
+        ])
+        UsdPhysics.CollisionAPI.Apply(prim)
+        prim.CreateAttribute(
+            "primvars:displayColor",
+            Sdf.ValueTypeNames.Color3fArray,
+        ).Set([Gf.Vec3f(0.95, 0.95, 0.90)])
+        return prim, dims
 
     @staticmethod
     def _choose_asset_from_pool(pool):
@@ -165,9 +307,70 @@ class SceneBuilder:
                 prims_in = prims_info['primsIn']
                 if not isinstance(prims_in, (list, tuple)):
                     prims_in = [prims_in]
+                self.table_root_paths = [str(prim.GetPath()) for prim in prims_in]
                 self.table_prim_paths = [str(prim.GetPath()) + "/Ref/material" for prim in prims_in]
                 self._ensure_static_mesh_colliders(self.table_prim_paths, label="table")
+                table_contact_cfg = self.cfg.get("table", {}).get("contact", {})
+                table_material = self._physics_material("GraspTableContact", table_contact_cfg)
+                self._bind_physics_material_under_paths(
+                    self.table_prim_paths,
+                    table_material,
+                    label="table",
+                )
         return self.table
+
+    def get_table_world_bounds(self):
+        """Return the combined table AABB as (minimum, maximum) world XYZ arrays."""
+        if self._table_world_bounds is not None:
+            return self._table_world_bounds
+
+        from pxr import Usd, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None or not self.table_root_paths:
+            return None
+
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+            useExtentsHint=True,
+        )
+        minimum = np.full(3, np.inf, dtype=np.float64)
+        maximum = np.full(3, -np.inf, dtype=np.float64)
+        for path in self.table_root_paths:
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                continue
+            aligned_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            minimum = np.minimum(minimum, np.asarray(aligned_range.GetMin(), dtype=np.float64))
+            maximum = np.maximum(maximum, np.asarray(aligned_range.GetMax(), dtype=np.float64))
+
+        if not np.all(np.isfinite(minimum)) or not np.all(np.isfinite(maximum)):
+            return None
+        self._table_world_bounds = (minimum, maximum)
+        print(f"[SceneBuilder] Table world bounds: min={minimum}, max={maximum}")
+        return self._table_world_bounds
+
+    def get_parts_outside_table(self, edge_tolerance=0.02, fall_distance=0.08):
+        """Return part paths whose centers have left or fallen below the table."""
+        bounds = self.get_table_world_bounds()
+        if bounds is None:
+            return []
+
+        minimum, maximum = bounds
+        outside = []
+        for part in self.get_parts_world_poses():
+            position = np.asarray(part["position"], dtype=np.float64)
+            outside_xy = (
+                position[0] < minimum[0] - edge_tolerance
+                or position[0] > maximum[0] + edge_tolerance
+                or position[1] < minimum[1] - edge_tolerance
+                or position[1] > maximum[1] + edge_tolerance
+            )
+            below_table = position[2] < maximum[2] - fall_distance
+            if outside_xy or below_table:
+                outside.append(part["prim_path"])
+        return outside
 
     def build_ConveyorBelt(self):
         self.ConveyorBelt_cfg = self.cfg['ConveyorBelt']
@@ -1413,6 +1616,34 @@ class SceneBuilder:
             cx*cy*sz - sx*sy*cz,
         ], dtype=np.float64)
 
+    def _sample_part_euler_xyz(self, use_fixed_task3_spawn=False, fixed_cfg=None):
+        """Sample a part orientation. Task1 defaults to upright yaw-only scatter."""
+        fixed_cfg = fixed_cfg or {}
+        if use_fixed_task3_spawn and not fixed_cfg.get('random_rotation', True):
+            return np.radians(
+                np.array(fixed_cfg.get('rotation_deg', [0, 0, 0]), dtype=np.float64)
+            )
+
+        rotation_mode = str(self.part_cfg.get('rotation_mode', 'upright')).lower()
+        if rotation_mode == 'upright':
+            roll_pitch = np.radians(
+                np.array(self.part_cfg.get('upright_rotation_deg', [0, 0]), dtype=np.float64)
+            ).flatten()
+            if roll_pitch.size == 1:
+                roll_pitch = np.array([roll_pitch[0], 0.0], dtype=np.float64)
+            roll = float(roll_pitch[0])
+            pitch = float(roll_pitch[1]) if roll_pitch.size > 1 else 0.0
+            yaw_range_deg = self.part_cfg.get('yaw_range_deg', [-180, 180])
+            yaw_min, yaw_max = [float(v) for v in yaw_range_deg]
+            yaw = np.radians(random.uniform(yaw_min, yaw_max))
+            return np.array([roll, pitch, yaw], dtype=np.float64)
+
+        return np.array([
+            random.uniform(-np.pi/2, np.pi/2),
+            random.uniform(-np.pi/2, np.pi/2),
+            random.uniform(-np.pi/2, np.pi/2),
+        ], dtype=np.float64)
+
     def _delete_old_parts(self):
         """删除旧零件：清除 rigid prim 缓存 → 从 USD stage 删除 prim"""
         import omni.usd
@@ -1477,11 +1708,19 @@ class SceneBuilder:
                 prim_path = target_paths[idx]
                 idx += 1
 
-                usd_file = self._resolve_asset_path(self._choose_asset_from_pool(pool))
                 part_scale = self._part_scale_for_type(part_type)
-
-                stage_utils.add_reference_to_stage(usd_path=usd_file, prim_path=prim_path)
-                prim = stage.GetPrimAtPath(prim_path)
+                use_simple_block = bool(self.part_cfg.get("use_simple_block", False))
+                if use_simple_block:
+                    prim, xform_scale = self._create_simple_block_part(
+                        stage,
+                        prim_path,
+                        part_scale,
+                    )
+                else:
+                    usd_file = self._resolve_asset_path(self._choose_asset_from_pool(pool))
+                    stage_utils.add_reference_to_stage(usd_path=usd_file, prim_path=prim_path)
+                    prim = stage.GetPrimAtPath(prim_path)
+                    xform_scale = part_scale
                 created_paths.append(prim_path)
                 if part_type is not None:
                     self.part_type_by_prim_path[prim_path] = part_type
@@ -1492,6 +1731,7 @@ class SceneBuilder:
                     enabled=True,
                 )
                 self._sanitize_rigid_bodies_under_paths(stage, prim_path, "Part")
+                self._apply_part_contact_physics(prim, prim_path)
 
                 if use_sampled_spawn:
                     xy = sampled_xy_positions[idx - 1]
@@ -1507,14 +1747,10 @@ class SceneBuilder:
                         float(center[1] + random.uniform(-half_y, half_y)),
                         float(center[2] + z_offset),
                     )
-                if use_fixed_task3_spawn and not fixed_cfg.get('random_rotation', True):
-                    euler = np.radians(np.array(fixed_cfg.get('rotation_deg', [0, 0, 0]), dtype=np.float64))
-                else:
-                    euler = np.array([
-                        random.uniform(-np.pi / 2, np.pi / 2),
-                        random.uniform(-np.pi / 2, np.pi / 2),
-                        random.uniform(-np.pi / 2, np.pi / 2),
-                    ])
+                euler = self._sample_part_euler_xyz(
+                    use_fixed_task3_spawn=use_fixed_task3_spawn,
+                    fixed_cfg=fixed_cfg,
+                )
                 quat = self._euler_to_quat_wxyz(euler)
 
                 xformable = UsdGeom.Xformable(prim)
@@ -1525,9 +1761,9 @@ class SceneBuilder:
                 )
                 xformable.AddScaleOp().Set(
                     Gf.Vec3f(
-                        float(part_scale[0]),
-                        float(part_scale[1]),
-                        float(part_scale[2]),
+                        float(xform_scale[0]),
+                        float(xform_scale[1]),
+                        float(xform_scale[2]),
                     )
                 )
 
@@ -1623,6 +1859,17 @@ class SceneBuilder:
             edge_margin_y = float(self.part_cfg.get('scatter_edge_margin_y', max(0.02, half_y * 0.15)))
             usable_half_x = max(half_x - edge_margin_x, half_x * 0.25)
             usable_half_y = max(half_y - edge_margin_y, half_y * 0.25)
+            sample_center = np.asarray(
+                self.part_cfg.get('scatter_center_xy', [center[0], center[1]]),
+                dtype=np.float64,
+            )
+            scatter_half_size = self.part_cfg.get('scatter_half_size_xy')
+            if scatter_half_size is not None:
+                scatter_half_size = np.asarray(scatter_half_size, dtype=np.float64)
+                usable_half_x = min(usable_half_x, max(0.0, float(scatter_half_size[0])))
+                usable_half_y = min(usable_half_y, max(0.0, float(scatter_half_size[1])))
+            else:
+                sample_center = np.array([center[0], center[1]], dtype=np.float64)
             min_distance = float(
                 self.part_cfg.get(
                     'scatter_min_distance',
@@ -1632,8 +1879,8 @@ class SceneBuilder:
 
             def task1_candidate():
                 return (
-                    center[0] + random.uniform(-usable_half_x, usable_half_x),
-                    center[1] + random.uniform(-usable_half_y, usable_half_y),
+                    float(sample_center[0] + random.uniform(-usable_half_x, usable_half_x)),
+                    float(sample_center[1] + random.uniform(-usable_half_y, usable_half_y)),
                 )
 
             positions = []
@@ -1771,14 +2018,10 @@ class SceneBuilder:
                 xy[1],
                 center[2] + z_offset,
             ], dtype=np.float64)
-            if use_fixed_task3_spawn and not fixed_cfg.get('random_rotation', True):
-                euler = np.radians(np.array(fixed_cfg.get('rotation_deg', [0, 0, 0]), dtype=np.float64))
-            else:
-                euler = np.array([
-                    random.uniform(-np.pi/2, np.pi/2),
-                    random.uniform(-np.pi/2, np.pi/2),
-                    random.uniform(-np.pi/2, np.pi/2),
-                ])
+            euler = self._sample_part_euler_xyz(
+                use_fixed_task3_spawn=use_fixed_task3_spawn,
+                fixed_cfg=fixed_cfg,
+            )
             quat = self._euler_to_quat_wxyz(euler)
 
             rigid.set_world_pose(position=pos, orientation=quat)

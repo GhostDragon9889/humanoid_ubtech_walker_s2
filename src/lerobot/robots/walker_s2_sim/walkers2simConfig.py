@@ -93,7 +93,7 @@ class WalkerS2Config(RobotConfig):
 
     # 控制设置
     # 键盘控制的速度级别 (rad/step)
-    speed_levels: list[float] = field(default_factory=lambda: [0.003, 0.008, 0.020, 0.050])
+    speed_levels: list[float] = field(default_factory=lambda: [0.001, 0.003, 0.008, 0.020])
     default_speed_index: int = 0
     tracking_interp_steps: int = 100
 

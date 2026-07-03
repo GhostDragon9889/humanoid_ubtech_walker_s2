@@ -198,7 +198,8 @@ class GraspPlanner:
             active_init = self.right_init.copy()
         print(f"[Grasp] Auto select arm: {self.grasp_arm} (object y={obj_robot[1]:.3f})")
 
-        # Compute grasp rotation: ensure end-effector Z-axis points down (gravity direction), X-axis points to part
+        # Build the palm target in the robot base frame. For a side grasp, the
+        # palm normal points toward the object and finger direction is configurable.
         world_down = np.array([0.0, 0.0, -1.0])  # World frame down direction
         base_down = self.coord.robot_world_R_inv @ world_down  # Transform to base frame
         print(f"[Grasp] World down (base frame): {base_down}")
@@ -207,17 +208,76 @@ class GraspPlanner:
         init_se3 = self.robot.ik_solver.get_ee_pose(self.grasp_arm)
         ee_pos_base = np.array(init_se3.translation)
 
-        # Compute grasp X-axis: end-effector -> part direction (projected to horizontal plane, perpendicular to gravity)
+        # Compute end-effector -> part direction as a fallback and for top grasps.
         reach_dir = obj_robot - ee_pos_base  # Direction from end-effector to part
         reach_dir = reach_dir - np.dot(reach_dir, base_down) * base_down  # Project to horizontal plane
         # Boundary handling: direction vector near zero
         if np.linalg.norm(reach_dir) < 1e-6:
             cand = np.array([1, 0, 0]) if abs(base_down[0]) < 0.9 else np.array([0, 1, 0])
             reach_dir = cand - np.dot(cand, base_down) * base_down
-        x_grasp = reach_dir / np.linalg.norm(reach_dir)  # Normalize X-axis
-        y_grasp = np.cross(base_down, x_grasp)  # Compute Y-axis (right-handed coordinate system)
-        y_grasp /= np.linalg.norm(y_grasp)
-        desired_palm_R = np.column_stack([x_grasp, y_grasp, base_down])
+        reach_dir /= np.linalg.norm(reach_dir)
+        grasp_orientation = str(self.grasp_cfg.get("grasp_orientation", "top")).lower()
+        if grasp_orientation == "side":
+            side_approach_mode = str(
+                self.grasp_cfg.get("side_approach_mode", "arm_lateral")
+            ).lower()
+            if side_approach_mode == "from_hand":
+                z_grasp = reach_dir
+            else:
+                # Tienkung-style side grasp: keep the hand vertical and approach
+                # from the active arm's outside lateral side, not from the current
+                # wrist-to-object diagonal.
+                lateral_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+                lateral_axis = lateral_axis - np.dot(lateral_axis, base_down) * base_down
+                if np.linalg.norm(lateral_axis) < 1e-6:
+                    lateral_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+                    lateral_axis = lateral_axis - np.dot(lateral_axis, base_down) * base_down
+                lateral_axis /= np.linalg.norm(lateral_axis)
+
+                # Base +Y is the robot's left side in the imported Walker frame.
+                # Palm +Z points from the palm toward the object.
+                z_grasp = -lateral_axis if self.grasp_arm == "left" else lateral_axis
+
+                forward_bias = float(self.grasp_cfg.get("side_forward_bias", 0.0))
+                if abs(forward_bias) > 1e-6:
+                    forward_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+                    forward_axis = forward_axis - np.dot(forward_axis, base_down) * base_down
+                    forward_axis /= np.linalg.norm(forward_axis)
+                    z_grasp = z_grasp + forward_bias * forward_axis
+                    z_grasp /= np.linalg.norm(z_grasp)
+
+            finger_direction = str(
+                self.grasp_cfg.get("side_finger_direction", "forward")
+            ).lower()
+            if finger_direction == "down":
+                x_grasp = base_down
+            elif finger_direction == "up":
+                x_grasp = -base_down
+            else:
+                forward_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+                forward_axis = forward_axis - np.dot(forward_axis, base_down) * base_down
+                if np.linalg.norm(forward_axis) < 1e-6:
+                    forward_axis = reach_dir
+                forward_axis /= np.linalg.norm(forward_axis)
+                x_grasp = -forward_axis if finger_direction == "backward" else forward_axis
+
+            x_grasp = x_grasp - np.dot(x_grasp, z_grasp) * z_grasp
+            if np.linalg.norm(x_grasp) < 1e-6:
+                x_grasp = reach_dir - np.dot(reach_dir, z_grasp) * z_grasp
+            x_grasp /= np.linalg.norm(x_grasp)
+            y_grasp = np.cross(z_grasp, x_grasp)
+            y_grasp /= np.linalg.norm(y_grasp)
+            x_grasp = np.cross(y_grasp, z_grasp)
+            x_grasp /= np.linalg.norm(x_grasp)
+            desired_palm_R = np.column_stack([x_grasp, y_grasp, z_grasp])
+            print(f"[Grasp] Side finger direction: {finger_direction}")
+            print(f"[Grasp] Side approach mode: {side_approach_mode}")
+        else:
+            x_grasp = reach_dir
+            y_grasp = np.cross(base_down, x_grasp)
+            y_grasp /= np.linalg.norm(y_grasp)
+            desired_palm_R = np.column_stack([x_grasp, y_grasp, base_down])
+        print(f"[Grasp] Orientation mode: {grasp_orientation}")
         grasp_frame = str(self.grasp_cfg.get("grasp_frame", "sixforce")).lower()
 
         if grasp_frame == "palm":

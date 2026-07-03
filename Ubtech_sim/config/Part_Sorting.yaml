@@ -22,11 +22,33 @@ part:
   # without making every attempt fail on tiny contact margins.
   num_parts_a: 1  # Part A quantity (overrides num_parts)
   num_parts_b: 0  # Part B quantity (overrides num_parts)
-  scale: [2.0, 2.0, 2.0]
+  use_simple_block: true
+  simple_block_size: [0.056, 0.040, 0.088]
+  scale: [1.0, 1.0, 1.0]
+  rotation_mode: upright
+  upright_rotation_deg: [0, 0]
+  yaw_range_deg: [-180, 180]
+  mass: 0.45
+  contact:
+    static_friction: 2.0
+    dynamic_friction: 1.6
+    restitution: 0.0
+    contact_offset: 0.002
+    rest_offset: 0.0
+    max_linear_velocity: 1.0
+    max_angular_velocity: 4.0
+    damping:
+      linear: 0.25
+      angular: 0.50
+  auto_reset_outside_table: true
+  table_edge_tolerance: 0.02
+  table_fall_distance: 0.08
+  scatter_center_xy: [0.75, 0.20]
+  scatter_half_size_xy: [0.035, 0.025]
   scatter_min_distance: 0.18
   scatter_edge_margin_x: 0.045
   scatter_edge_margin_y: 0.045
-  spawn_z_offset: 0.04
+  spawn_z_offset: 0.055
 
 plane:
   plane_position: 
@@ -40,6 +62,10 @@ table:
   - [0.75, 0.3, 0.5]
   table_scale: 
   - [1.9927, 1.8738, 1.1109]
+  contact:
+    static_friction: 1.8
+    dynamic_friction: 1.4
+    restitution: 0.0
 
 robot:
   # Official merged body + UBT hand v3 (relative to repo root zollent_technology/)
@@ -77,12 +103,16 @@ grasp:
       palm_tcp_offset: [0.065, 0.0, 0.035]
       palm_tcp_lateral_offset: 0.0
   pregrasp_distance: 0.08
-  approach_direction: vertical
+  grasp_orientation: side
+  side_approach_mode: arm_lateral
+  side_forward_bias: 0.0
+  side_finger_direction: forward
+  approach_direction: palm_normal
   grasp_frame: palm
   # Thumb-index pinch center in palm_link coordinates: forward, lateral,
   # palm-normal (m). The lateral offset is mirrored for left/right hands.
-  # The planner points palm +Z downward, so a positive Z offset keeps the palm
-  # above the object/table while the TCP is at the grasp point.
+  # For a side grasp, palm +X points forward along the tabletop and palm +Z
+  # points horizontally inward from the active arm side, like the Tienkung apple grasp.
   palm_tcp_offset: [0.055, 0.0, 0.04]
   palm_tcp_lateral_offset: 0.028
   mirror_palm_tcp_lateral: true

@@ -141,6 +141,7 @@ class WalkerS2sim(Robot):
         # 回调锁和注册状态
         self._callback_lock = threading.Lock()
         self._callbacks_registered = False
+        self._camera_render_callback_registered = False
 
         # Inference 模式：send_action 写入 pending，callback 消费并执行
         self._pending_absolute_action: Optional[np.ndarray] = None
@@ -155,6 +156,9 @@ class WalkerS2sim(Robot):
 
         # 步数计数器
         self._send_action_step_idx: int = 0
+        self._out_of_bounds_check_counter: int = 0
+        self._scene_reset_requested: bool = False
+        self._scene_reset_reason: str = ""
 
         # 频率监测（墙钟实测）
         self._phys_cb_count: int = 0
@@ -541,8 +545,11 @@ class WalkerS2sim(Robot):
 
         arm = planner.grasp_arm
         grasp_pose = np.asarray(planner.active_grasp, dtype=float)
-        if str(active_grasp_cfg.get("approach_direction", "tool")).lower() == "vertical":
+        approach_mode = str(active_grasp_cfg.get("approach_direction", "tool")).lower()
+        if approach_mode == "vertical":
             approach_direction = coord.robot_world_R_inv @ np.array([0.0, 0.0, -1.0])
+        elif approach_mode == "palm_normal" and planner.palm_target_R_base is not None:
+            approach_direction = np.asarray(planner.palm_target_R_base[:, 2], dtype=float)
         else:
             approach_direction = np.asarray(planner.R_grasp[:, 2], dtype=float)
         pregrasp_pose = grasp_pose.copy()
@@ -877,6 +884,7 @@ class WalkerS2sim(Robot):
         self._world.add_physics_callback("foam_sync", self._foam_sync_callback)
         if self.config.enable_sim_cameras:
             self._world.add_render_callback("camera_images", self._camera_images_callback)
+            self._camera_render_callback_registered = True
         self._callbacks_registered = True
         logger.info(
             "Physics callbacks registered%s",
@@ -896,11 +904,14 @@ class WalkerS2sim(Robot):
                     remove_physics(cb_name)
                 except Exception:
                     pass
-        if callable(remove_render):
+        if callable(remove_render) and self._camera_render_callback_registered:
             try:
                 remove_render("camera_images")
             except Exception:
                 pass
+            self._camera_render_callback_registered = False
+        else:
+            self._camera_render_callback_registered = False
         self._callbacks_registered = False
 
     # ---- 回调实现 ----
@@ -1272,6 +1283,29 @@ class WalkerS2sim(Robot):
         if callable(get_transforms):
             get_transforms(step_size)
 
+        if self.config.task_cfg.get("task_number") != 1 or self._scene_reset_requested:
+            return
+        part_cfg = self.config.task_cfg.get("part", {})
+        if not bool(part_cfg.get("auto_reset_outside_table", False)):
+            return
+
+        self._out_of_bounds_check_counter += 1
+        check_every = max(1, int(round(0.1 / self.config.physics_dt)))
+        if self._out_of_bounds_check_counter % check_every != 0:
+            return
+
+        get_outside = getattr(self._scene_builder, "get_parts_outside_table", None)
+        if not callable(get_outside):
+            return
+        outside_paths = get_outside(
+            edge_tolerance=float(part_cfg.get("table_edge_tolerance", 0.02)),
+            fall_distance=float(part_cfg.get("table_fall_distance", 0.08)),
+        )
+        if outside_paths:
+            self._scene_reset_requested = True
+            self._scene_reset_reason = f"part left table: {', '.join(outside_paths)}"
+            logger.warning("[auto_reset] Requested: %s", self._scene_reset_reason)
+
     def _foam_sync_callback(self, _step_size: float) -> None:
         """task4 专用：同步泡沫到箱子"""
         if self._scene_builder is None:
@@ -1361,6 +1395,15 @@ class WalkerS2sim(Robot):
         logger.info("步骤 2: 加载场景 USD...")
         import os
         scene_path = os.path.join(self.config.task_cfg.get("root_path", ""), self.config.task_cfg.get("scene_usd", ""))
+        if os.path.basename(scene_path) == "minimal_grasp_scene.usda":
+            import shutil
+            import tempfile
+
+            runtime_scene_dir = tempfile.mkdtemp(prefix="walker_s2_scene_")
+            runtime_scene_path = os.path.join(runtime_scene_dir, "minimal_grasp_scene.usda")
+            shutil.copyfile(scene_path, runtime_scene_path)
+            scene_path = runtime_scene_path
+            logger.info("Using isolated runtime scene: %s", scene_path)
         logger.info(f"场景路径: {scene_path}")
         
         if not os.path.exists(scene_path):
@@ -1553,12 +1596,24 @@ class WalkerS2sim(Robot):
                 self._world.step(render=render)
             elif self._kit is not None:
                 self._kit.update()
+            self._perform_requested_scene_reset()
         except Exception:
             logger.exception("pump_simulation failed")
             raise
         if not self.sim_is_running():
             logger.error("Isaac Sim stopped during pump_simulation")
             return False
+        return True
+
+    def _perform_requested_scene_reset(self) -> bool:
+        """Execute a callback-requested reset from the main thread."""
+        if not self._scene_reset_requested:
+            return False
+        reason = self._scene_reset_reason or "automatic reset"
+        self._scene_reset_requested = False
+        self._scene_reset_reason = ""
+        logger.warning("[auto_reset] Resetting scene: %s", reason)
+        self.reset()
         return True
 
     def disconnect(self) -> None:
@@ -1626,6 +1681,8 @@ class WalkerS2sim(Robot):
         try:
             if not self.is_connected:
                 raise RuntimeError("机器人未连接")
+
+            self._perform_requested_scene_reset()
 
             if action is not None:
                 # ====== 模式 A: 推理/回放（统一 20D） ======
@@ -1914,6 +1971,9 @@ class WalkerS2sim(Robot):
 
         # 6. 重置步数计数器
         self._send_action_step_idx = 0
+        self._out_of_bounds_check_counter = 0
+        self._scene_reset_requested = False
+        self._scene_reset_reason = ""
 
         # 7. 清空 pending 控制状态
         with self._callback_lock:
