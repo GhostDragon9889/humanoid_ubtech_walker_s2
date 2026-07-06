@@ -250,6 +250,8 @@ def teleoperate(cfg: TeleoperateConfig):
     listener, events = init_keyboard_listener()
     log_say("调整好按Enter键开始控制...", play_sounds=False)
     logging.info("Waiting for Enter before teleoperation. Press Esc to stop.")
+    if robot.name == "walkerS2" and hasattr(robot, "pause_for_user_start"):
+        robot.pause_for_user_start()
     wait_t0 = time.perf_counter()
     last_wait_log_t = wait_t0
     while not events["start_record"]:
@@ -286,6 +288,8 @@ def teleoperate(cfg: TeleoperateConfig):
             last_wait_log_t = now
 
         precise_sleep(max(1 / cfg.fps, 0.0))
+    if robot.name == "walkerS2" and hasattr(robot, "resume_after_user_start"):
+        robot.resume_after_user_start()
     try:
         if robot.name == "walkerS2" and hasattr(teleop, "enable_terminal_polling"):
             teleop.enable_terminal_polling()

@@ -573,6 +573,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
         log_say("调整好按Enter键开始录制...", cfg.play_sounds)
         logging.info("Waiting for Enter before recording. Press Esc to stop.")
+        if robot.name == "walkerS2" and hasattr(robot, "pause_for_user_start"):
+            robot.pause_for_user_start()
         wait_t0 = time.perf_counter()
         last_wait_log_t = wait_t0
         while not events["start_record"]:
@@ -611,6 +613,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             precise_sleep(max(1 / cfg.dataset.fps, 0.0))
 
         logging.info("Enter received; starting recording.")
+        if robot.name == "walkerS2" and hasattr(robot, "resume_after_user_start"):
+            robot.resume_after_user_start()
         if robot.name == "walkerS2" and teleop is not None and hasattr(teleop, "enable_terminal_polling"):
             teleop.enable_terminal_polling()
         with VideoEncodingManager(dataset):

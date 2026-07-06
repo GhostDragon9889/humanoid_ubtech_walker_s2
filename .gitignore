@@ -68,6 +68,8 @@ datasets/*
 !datasets/README.md
 
 # 防止大文件落在仓库根目录时被误提交
+core
+core.*
 *.safetensors
 *.ckpt
 *.pth

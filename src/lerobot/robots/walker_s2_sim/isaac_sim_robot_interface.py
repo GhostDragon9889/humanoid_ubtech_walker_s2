@@ -115,9 +115,10 @@ UBT_HAND_JOINT_LIMITS: dict[str, tuple[float, float]] = {
 
 UBT_HAND_POSE_FRACTIONS: dict[str, tuple[float, ...]] = {
     # Each value is a normalized curl amount for UBT_HAND_JOINT_NAMES order.
-    # Sign is handled by the joint limit; 0.0 is open and 1.0 moves toward the
-    # useful flexion/opposition limit.
-    "open": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    # Sign is handled by the joint limit. Keep the physical open pose slightly
+    # inside every hard stop; commanding exactly 0 makes the drive and limit
+    # solver fight each other and causes idle finger chatter.
+    "open": (0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03),
     # Keep the thumb opposed and the fingers slightly flexed while the arm moves.
     # A fully open hand leaves the long thumb links free to strike the table.
     "travel": (0.35, 0.22, 0.14, 0.12, 0.10, 0.10, 0.08, 0.10, 0.08, 0.10, 0.08),
@@ -129,13 +130,25 @@ UBT_HAND_POSE_FRACTIONS: dict[str, tuple[float, ...]] = {
     "tripod": (0.82, 0.66, 0.56, 0.60, 0.54, 0.58, 0.50, 0.18, 0.14, 0.12, 0.10),
 }
 
-UBT_HAND_CONTROL_PROFILES: dict[str, tuple[float, float, float]] = {
-    # kp, kd, max effort. Free-space motion is strongly damped; contact motion
-    # follows the compliant hand setup used by the TienKung simulation.
-    "firm": (60.0, 10.0, 20.0),
-    "contact": (10.0, 2.0, 10.0),
+# Maximum principal inertia of each official actuated child link, in
+# UBT_HAND_JOINT_NAMES order. The right-hand values are symmetric.
+UBT_HAND_JOINT_INERTIAS = (
+    1.31111335e-6,
+    3.32254706e-5,
+    1.87688540e-6,
+    3.57000000e-6,
+    2.65758516e-6,
+    3.44034879e-6,
+    3.48784866e-6,
+    3.44034879e-6,
+    2.86472779e-6,
+    3.44034879e-6,
+    1.82560831e-6,
+)
+UBT_HAND_DRIVE_PROFILES = {
+    "firm": {"frequency": 45.0, "min_kp": 0.008, "max_effort": 0.05},
+    "contact": {"frequency": 35.0, "min_kp": 0.005, "max_effort": 0.03},
 }
-
 
 # =========================================================================
 # YAML Task configuration loading
@@ -411,9 +424,10 @@ class IsaacSimRobotInterface:
         self.dexterous_hand_target_positions: dict[str, list[float]] = {"L": [], "R": []}
         self.dexterous_hand_active_pose: dict[str, str] = {"L": "open", "R": "open"}
         self.dexterous_hand_close_pose: dict[str, str] = {"L": "power", "R": "power"}
-        self.dexterous_hand_max_step = 0.035
+        self.dexterous_hand_max_step = 0.004
         self._dexterous_hand_all_indices: list[int] = []
-        self._dexterous_hand_control_profile: Optional[str] = None
+        self._dexterous_hand_drive_profile: Optional[str] = None
+        self._dexterous_hand_drive_sides: tuple[str, ...] = ()
         self._standing_control_indices: list[int] = []
         self.body_joint_indices: list[int] = []
         self.head_joint_indices: list[int] = []
@@ -541,14 +555,14 @@ class IsaacSimRobotInterface:
             self.dexterous_hand_current_positions[side] = list(target)
 
     def open_dexterous_hand(self, side: str) -> None:
-        self.snap_dexterous_hand_pose(side, "open")
+        self.set_dexterous_hand_pose(side, "open")
 
     def travel_dexterous_hand(self, side: str) -> None:
         self.snap_dexterous_hand_pose(side, "travel")
 
     def prepare_dexterous_hand_for_arm_motion(self, side: str) -> None:
-        if self.dexterous_hand_active_pose.get(side) in ("open", "travel"):
-            self.snap_dexterous_hand_pose(side, "open")
+        # Arm and hand targets are independent.
+        return
 
     def close_dexterous_hand(self, side: str, pose_name: Optional[str] = None) -> None:
         pose = pose_name or self.dexterous_hand_close_pose.get(side, "power")
@@ -564,6 +578,12 @@ class IsaacSimRobotInterface:
         if side not in ("L", "R"):
             return
         if not self.dexterous_hand_joint_indices.get(side):
+            return
+
+        if direction < 0.0:
+            # Opening moves away from contact, so return directly to the stable
+            # free-space hold instead of using the contact controller.
+            self.open_dexterous_hand(side)
             return
 
         close_pose = pose_name or self.dexterous_hand_close_pose.get(side, "power")
@@ -753,6 +773,17 @@ class IsaacSimRobotInterface:
                     self.initial_joint_positions[all_joint_names.index(joint_name)] = value
             self.standing_joint_positions = list(self.initial_joint_positions)
 
+        # The URDF's open position is also the lower/upper hard stop for every
+        # actuated hand joint. Initialize and reset to the guarded open pose so
+        # physics never starts with the finger drives pressing into those stops.
+        for side in ("L", "R"):
+            open_pose = self.dexterous_hand_current_positions.get(side) or []
+            for local_i, global_idx in enumerate(self.dexterous_hand_joint_indices.get(side, [])):
+                if local_i < len(open_pose):
+                    value = float(open_pose[local_i])
+                    self.initial_joint_positions[global_idx] = value
+                    self.standing_joint_positions[global_idx] = value
+
         self.finger_joint_initial_positions = [
             self.gripper_open_width
         ] * len(self.finger_joint_indices)
@@ -835,9 +866,11 @@ class IsaacSimRobotInterface:
         max_efforts = []
         for name in all_joint_names:
             if name in hand_joint_names:
-                kps.append(60.0)
-                kds.append(6.0)
-                max_efforts.append(20.0)
+                # Dexterous hands use deterministic interpolated state control;
+                # disable imported drives so they cannot fight that controller.
+                kps.append(0.0)
+                kds.append(0.0)
+                max_efforts.append(0.0)
             elif name in self.arm_joint_names:
                 kps.append(self.arm_drive_stiffness)
                 kds.append(self.arm_drive_damping)
@@ -863,7 +896,8 @@ class IsaacSimRobotInterface:
             kps=torch.tensor([kps], dtype=torch.float32),
             kds=torch.tensor([kds], dtype=torch.float32),
         )
-        self._dexterous_hand_control_profile = None
+        self._dexterous_hand_drive_profile = None
+        self._dexterous_hand_drive_sides = ()
         if hasattr(self._articulation, "set_max_efforts"):
             self._articulation.set_max_efforts(
                 torch.tensor([max_efforts], dtype=torch.float32)
@@ -911,52 +945,99 @@ class IsaacSimRobotInterface:
         if self.use_explicit_standing_body:
             self._lock_body_joints_to_standing()
 
-    def _set_dexterous_hand_control_profile(self, profile: str) -> None:
-        if profile == self._dexterous_hand_control_profile:
+    def _configure_dexterous_hand_drives(
+        self,
+        profile: str,
+        physical_sides: Optional[set[str]] = None,
+    ) -> None:
+        active_sides = physical_sides or {"L", "R"}
+        active_sides_key = tuple(sorted(active_sides))
+        if (
+            profile == self._dexterous_hand_drive_profile
+            and active_sides_key == self._dexterous_hand_drive_sides
+        ):
             return
-        if profile not in UBT_HAND_CONTROL_PROFILES:
-            raise ValueError(f"Unknown dexterous hand control profile: {profile}")
+        cfg = UBT_HAND_DRIVE_PROFILES[profile]
+        frequency = float(cfg["frequency"])
+        min_kp = float(cfg["min_kp"])
+        max_effort = float(cfg["max_effort"])
+        kps = []
+        kds = []
+        efforts = []
+        for side in ("L", "R"):
+            for inertia in UBT_HAND_JOINT_INERTIAS:
+                if side in active_sides:
+                    kp = max(min_kp, inertia * frequency**2)
+                    kd = 2.0 * np.sqrt(kp * inertia)
+                    effort = min(max_effort, max(0.008, 2.0 * kp))
+                else:
+                    kp = 0.0
+                    kd = 0.0
+                    effort = 0.0
+                kps.append(kp)
+                kds.append(kd)
+                efforts.append(effort)
 
-        kp, kd, max_effort = UBT_HAND_CONTROL_PROFILES[profile]
+        joint_indices = torch.tensor(self._dexterous_hand_all_indices, dtype=torch.int32)
+        self._articulation.set_gains(
+            kps=torch.tensor([kps], dtype=torch.float32),
+            kds=torch.tensor([kds], dtype=torch.float32),
+            joint_indices=joint_indices,
+        )
+        self._articulation.set_max_efforts(
+            torch.tensor([efforts], dtype=torch.float32),
+            joint_indices=joint_indices,
+        )
+        self._dexterous_hand_drive_profile = profile
+        self._dexterous_hand_drive_sides = active_sides_key
+        logger.info(
+            "Dexterous physical drives: %s sides=%s kp=[%.4f, %.4f] effort=[%.4f, %.4f]",
+            profile,
+            ",".join(sorted(active_sides)),
+            min(kps),
+            max(kps),
+            min(efforts),
+            max(efforts),
+        )
+
+    def _disable_dexterous_hand_drives(self) -> None:
+        if self._articulation is None or not self._dexterous_hand_all_indices:
+            return
+        if self._dexterous_hand_drive_profile is None:
+            return
+
         joint_indices = torch.tensor(self._dexterous_hand_all_indices, dtype=torch.int32)
         count = len(self._dexterous_hand_all_indices)
         self._articulation.set_gains(
-            kps=torch.full((1, count), kp, dtype=torch.float32),
-            kds=torch.full((1, count), kd, dtype=torch.float32),
+            kps=torch.zeros((1, count), dtype=torch.float32),
+            kds=torch.zeros((1, count), dtype=torch.float32),
             joint_indices=joint_indices,
         )
-        if hasattr(self._articulation, "set_max_efforts"):
-            self._articulation.set_max_efforts(
-                torch.full((1, count), max_effort, dtype=torch.float32),
-                joint_indices=joint_indices,
-            )
-        self._dexterous_hand_control_profile = profile
-        logger.info(
-            "Dexterous hand control profile: %s (kp=%.1f kd=%.1f effort=%.1f)",
-            profile,
-            kp,
-            kd,
-            max_effort,
+        self._articulation.set_max_efforts(
+            torch.zeros((1, count), dtype=torch.float32),
+            joint_indices=joint_indices,
         )
+        self._dexterous_hand_drive_profile = None
+        self._dexterous_hand_drive_sides = ()
 
-    def apply_dexterous_hand_targets(self, control_profile: str = "firm") -> None:
-        """Smooth and hard-lock dexterous hand joints to their target pose.
+    def _hard_hold_dexterous_hand_targets(self) -> None:
+        """Servo-hold free-space hand poses without injecting contact forces.
 
-        The imported UBT hand has small distal links that visibly oscillate when
-        held only through low-force PhysX drives. For keyboard teleop the hand
-        poses are discrete presets, so direct joint-position holding gives the
-        stable behavior we had before while preserving the same public API.
-        ``control_profile`` is accepted for compatibility with assisted grasp.
+        The official UBT hand links are very light. Leaving them under a weak
+        PhysX drive while idle makes the distal links chatter. For open/travel
+        poses there is no grasp contact to model, so use a deterministic servo
+        hold and reserve physical drives for closing/contact poses.
         """
-        if self._articulation is None or not self._dexterous_hand_all_indices:
-            return
-
+        self._disable_dexterous_hand_drives()
         self.step_dexterous_hands()
+
         hand_indices = []
         hand_values = []
         for side in ("L", "R"):
             values = self.dexterous_hand_current_positions.get(side) or []
-            for local_i, global_idx in enumerate(self.dexterous_hand_joint_indices.get(side, [])):
+            for local_i, global_idx in enumerate(
+                self.dexterous_hand_joint_indices.get(side, [])
+            ):
                 if local_i < len(values):
                     hand_indices.append(global_idx)
                     hand_values.append(float(values[local_i]))
@@ -964,15 +1045,94 @@ class IsaacSimRobotInterface:
         if not hand_indices:
             return
 
-        hand_indices_t = torch.tensor(hand_indices, dtype=torch.int32)
+        joint_indices = torch.tensor(hand_indices, dtype=torch.int32)
         self._articulation.set_joint_positions(
             torch.tensor(hand_values, dtype=torch.float32),
-            joint_indices=hand_indices_t,
+            joint_indices=joint_indices,
         )
         self._articulation.set_joint_velocities(
             torch.zeros(len(hand_indices), dtype=torch.float32),
-            joint_indices=hand_indices_t,
+            joint_indices=joint_indices,
         )
+
+    def apply_dexterous_hand_targets(self, control_profile: Optional[str] = None) -> None:
+        """Track interpolated hand targets.
+
+        Open/travel poses are servo-held for stability. Closing/contact poses
+        use bounded physical PhysX drives so object interaction remains
+        compliant instead of teleporting through contacts.
+        """
+        if self._articulation is None or not self._dexterous_hand_all_indices:
+            return
+
+        if control_profile is None:
+            contact_poses = {
+                "manual",
+                "power",
+                "pinch",
+                "tripod",
+                "power_pre",
+                "pinch_pre",
+                "tripod_pre",
+            }
+            physical_sides = {
+                side
+                for side in ("L", "R")
+                if self.dexterous_hand_active_pose.get(side) in contact_poses
+            }
+            control_profile = (
+                "contact"
+                if physical_sides
+                else "firm"
+            )
+        else:
+            physical_sides = {
+                side
+                for side in ("L", "R")
+                if self.dexterous_hand_active_pose.get(side)
+                not in {"open", "travel"}
+            } or {"L", "R"}
+
+        if control_profile == "firm":
+            self._hard_hold_dexterous_hand_targets()
+            return
+
+        self._configure_dexterous_hand_drives(control_profile, physical_sides)
+        self.step_dexterous_hands()
+        physical_indices = []
+        physical_values = []
+        hold_indices = []
+        hold_values = []
+        for side in ("L", "R"):
+            values = self.dexterous_hand_current_positions.get(side) or []
+            for local_i, global_idx in enumerate(
+                self.dexterous_hand_joint_indices.get(side, [])
+            ):
+                if local_i < len(values):
+                    if side in physical_sides:
+                        physical_indices.append(global_idx)
+                        physical_values.append(float(values[local_i]))
+                    else:
+                        hold_indices.append(global_idx)
+                        hold_values.append(float(values[local_i]))
+
+        if hold_indices:
+            hold_joint_indices = torch.tensor(hold_indices, dtype=torch.int32)
+            self._articulation.set_joint_positions(
+                torch.tensor(hold_values, dtype=torch.float32),
+                joint_indices=hold_joint_indices,
+            )
+            self._articulation.set_joint_velocities(
+                torch.zeros(len(hold_indices), dtype=torch.float32),
+                joint_indices=hold_joint_indices,
+            )
+
+        if physical_indices:
+            physical_joint_indices = torch.tensor(physical_indices, dtype=torch.int32)
+            self._articulation.set_joint_position_targets(
+                torch.tensor([physical_values], dtype=torch.float32),
+                joint_indices=physical_joint_indices,
+            )
 
     def _lock_body_joints_to_standing(self) -> None:
         """Hard-lock non-teleop body/head DOFs to the official standing pose."""

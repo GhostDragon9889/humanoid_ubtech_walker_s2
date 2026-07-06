@@ -1219,9 +1219,8 @@ class WalkerS2sim(Robot):
                 task_num=self.config.task_cfg.get("task_number", 1),
             )
 
-        # Keep dexterous hand presets stable during teleop. The hand interface
-        # accepts the profile argument for assisted-grasp compatibility, but
-        # currently hard-holds preset joints to avoid idle finger oscillation.
+        # Send one synchronized trajectory through bounded physical drives for
+        # all dexterous hand joints.
         self._robot_interface.apply_dexterous_hand_targets()
 
         # 夹持器控制：
@@ -1580,10 +1579,33 @@ class WalkerS2sim(Robot):
             return bool(self._kit.is_running())
         return self.is_connected
 
+    def pause_for_user_start(self) -> None:
+        """Freeze physics while the user is waiting to start teleoperation."""
+        if self._world is not None and self._world.is_playing():
+            self._world.pause()
+        # Terminal-launched Isaac does not commit synchronous pause() with an
+        # app update. Commit it here before entering the prompt loop.
+        if self._kit is not None:
+            self._kit.update()
+        if self._world is not None and self._world.is_playing():
+            raise RuntimeError("Isaac timeline failed to pause before Enter")
+        logger.info("Physics paused while waiting for Enter")
+
+    def resume_after_user_start(self) -> None:
+        """Resume physics and restore controller targets after the start prompt."""
+        if self._world is None:
+            return
+        if not self._world.is_playing():
+            self._world.play()
+        if self._robot_interface is not None:
+            self._robot_interface.apply_standing_pose_after_play()
+            self._robot_interface.apply_dexterous_hand_targets()
+        logger.info("Physics resumed after Enter")
+
     def pump_simulation(self, render: bool = True) -> bool:
         """Advance Isaac Sim during blocking waits (Enter prompt, etc.).
 
-        Uses world.step() so physics callbacks keep holding the robot pose.
+        When physics is paused, only update Kit so the window remains responsive.
         Returns False if the SimulationApp is no longer running.
         """
         if not self.is_connected:
@@ -1592,7 +1614,7 @@ class WalkerS2sim(Robot):
             logger.error("Isaac Sim exited unexpectedly (kit.is_running()=False)")
             return False
         try:
-            if self._world is not None:
+            if self._world is not None and self._world.is_playing():
                 self._world.step(render=render)
             elif self._kit is not None:
                 self._kit.update()

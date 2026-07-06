@@ -208,6 +208,85 @@ class SceneBuilder:
         except Exception as exc:
             print(f"[SceneBuilder] Part: failed to tune contact physics for {prim_path}: {exc}")
 
+    def _apply_robot_hand_contact_physics(self, root_path):
+        """Use small contact offsets on imported UBT hand collision prims.
+
+        The URDF importer gives the hand collision geometry normal PhysX
+        defaults. For small grasped objects those defaults can create a large
+        effective contact shell, so a small palm push resolves as a visible
+        launch. Keep the visual/inertial URDF data unchanged and only tune the
+        collision contact envelope.
+        """
+        try:
+            from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return
+            root = stage.GetPrimAtPath(root_path)
+            if not root.IsValid():
+                return
+
+            contact_cfg = {
+                "static_friction": 0.9,
+                "dynamic_friction": 0.7,
+                "restitution": 0.0,
+            }
+            material_prim = self._physics_material("RobotHandContact", contact_cfg)
+            material = UsdShade.Material(material_prim) if material_prim is not None else None
+            disabled_tokens = (
+                "hand_base_link",
+                "palm_link",
+            )
+            hand_tokens = (
+                "hand",
+                "palm",
+                "thumb",
+                "index",
+                "middle",
+                "ring",
+                "little",
+            )
+            tuned = 0
+            disabled = 0
+            for prim in Usd.PrimRange(root):
+                path_text = str(prim.GetPath()).lower()
+                if not any(token in path_text for token in hand_tokens):
+                    continue
+                if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                    continue
+                if any(token in path_text for token in disabled_tokens):
+                    prim.CreateAttribute(
+                        "physics:collisionEnabled",
+                        Sdf.ValueTypeNames.Bool,
+                    ).Set(False)
+                    disabled += 1
+                    continue
+                prim.CreateAttribute(
+                    "physxCollision:contactOffset",
+                    Sdf.ValueTypeNames.Float,
+                ).Set(0.0008)
+                prim.CreateAttribute(
+                    "physxCollision:restOffset",
+                    Sdf.ValueTypeNames.Float,
+                ).Set(0.0)
+                if material is not None and (
+                    prim.IsA(UsdGeom.Xform)
+                    or prim.IsA(UsdGeom.Mesh)
+                    or prim.IsA(UsdGeom.Cube)
+                    or prim.IsA(UsdGeom.Sphere)
+                    or prim.IsA(UsdGeom.Cylinder)
+                ):
+                    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+                tuned += 1
+            if tuned or disabled:
+                print(
+                    f"[SceneBuilder] Robot hand: tuned contact offsets on {tuned} "
+                    f"collision prims; disabled palm/base contact on {disabled}"
+                )
+        except Exception as exc:
+            print(f"[SceneBuilder] Robot hand: failed to tune contact physics: {exc}")
+
     def _create_simple_block_part(self, stage, prim_path, part_scale):
         """Create a clean box rigid body for grasp-contact calibration."""
         from pxr import Gf, Sdf, UsdGeom, UsdPhysics
@@ -1374,6 +1453,8 @@ class SceneBuilder:
 
         for _ in range(3):
             omni.kit.app.get_app().update()
+
+        self._apply_robot_hand_contact_physics(xform_path)
 
         self.robot_prim_path = articulation_root
         self.robot_xform_path = xform_path
