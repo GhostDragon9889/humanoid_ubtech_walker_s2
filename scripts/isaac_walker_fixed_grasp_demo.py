@@ -1264,12 +1264,36 @@ def main():
     if len(q_home) != len(dof_names):
         q_home = np.zeros(len(dof_names), dtype=float)
 
+    def resolve_dof_name(name):
+        if name in name_to_i:
+            return name
+        aliases = []
+        for prefix in ("hand3_v1_right_", "hand3_v1_left_"):
+            if name.startswith(prefix):
+                aliases.append(name[len(prefix) :])
+        aliases.append(name.split("/")[-1])
+
+        for alias in aliases:
+            if alias in name_to_i:
+                return alias
+
+        suffix_matches = []
+        for alias in aliases:
+            suffix_matches.extend([candidate for candidate in dof_names if candidate.endswith(alias)])
+        suffix_matches = list(dict.fromkeys(suffix_matches))
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        if len(suffix_matches) > 1:
+            print(f"[WARN] Ambiguous joint alias for {name}: {suffix_matches}")
+        return None
+
     def set_named(q, values):
         q = np.array(q, dtype=float).copy()
         missing = []
         for n, v in values.items():
-            if n in name_to_i:
-                q[name_to_i[n]] = float(v)
+            resolved = resolve_dof_name(n)
+            if resolved is not None:
+                q[name_to_i[resolved]] = float(v)
             else:
                 missing.append(n)
         if missing:
@@ -1396,14 +1420,43 @@ def main():
         (1.0, 0.0, 1.0),
         axis_length=0.10,
     )
-    right_hand_joint_names = list(right_hand_open.keys())
-    right_hand_indices = np.array([name_to_i[n] for n in right_hand_joint_names], dtype=int)
-    right_hand_open_pos = np.array([right_hand_open[n] for n in right_hand_joint_names], dtype=float)
-    right_hand_close_pos = np.array([right_hand_close[n] for n in right_hand_joint_names], dtype=float)
-    left_hand_joint_names = list(left_hand_open.keys())
-    left_hand_indices = np.array([name_to_i[n] for n in left_hand_joint_names], dtype=int)
-    left_hand_open_pos = np.array([left_hand_open[n] for n in left_hand_joint_names], dtype=float)
-    left_hand_close_pos = np.array([left_hand_close[n] for n in left_hand_joint_names], dtype=float)
+
+    def build_hand_control(open_values, close_values, side):
+        indices = []
+        open_pos = []
+        close_pos = []
+        missing = []
+        resolved_names = []
+        for n in open_values:
+            resolved = resolve_dof_name(n)
+            if resolved is None:
+                missing.append(n)
+                continue
+            indices.append(name_to_i[resolved])
+            open_pos.append(open_values[n])
+            close_pos.append(close_values[n])
+            resolved_names.append(resolved)
+        if missing:
+            print(f"[WARN] Missing {side} hand joints, skipped: {missing}")
+        if not indices:
+            raise RuntimeError(f"Could not resolve any {side} hand joints from imported DOFs")
+        print(f"[INFO] Resolved {side} hand joints: {resolved_names}")
+        return (
+            np.array(indices, dtype=int),
+            np.array(open_pos, dtype=float),
+            np.array(close_pos, dtype=float),
+        )
+
+    right_hand_indices, right_hand_open_pos, right_hand_close_pos = build_hand_control(
+        right_hand_open,
+        right_hand_close,
+        "right",
+    )
+    left_hand_indices, left_hand_open_pos, left_hand_close_pos = build_hand_control(
+        left_hand_open,
+        left_hand_close,
+        "left",
+    )
     hand_control = {
         "left": (left_hand_indices, left_hand_open_pos, left_hand_close_pos),
         "right": (right_hand_indices, right_hand_open_pos, right_hand_close_pos),
