@@ -251,7 +251,7 @@ class WalkerS2KeyboardTeleop(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self._keyboard_listener is not None
+        return self._keyboard_listener is not None or self._terminal_polling_enabled
 
     @property
     def is_calibrated(self) -> bool:
@@ -291,7 +291,7 @@ class WalkerS2KeyboardTeleop(Teleoperator):
             except Exception as e:
                 logger.warning(f"evdev 启动失败：{e}，尝试 pynput")
 
-        if PYNPUT_AVAILABLE:
+        if PYNPUT_AVAILABLE and self.config.enable_pynput_fallback:
             try:
                 self._keyboard_listener = keyboard.Listener(
                     on_press=self._on_key_press,
@@ -302,6 +302,8 @@ class WalkerS2KeyboardTeleop(Teleoperator):
                 return
             except Exception as e:
                 logger.warning(f"pynput 启动失败：{e}")
+        elif not self.config.enable_pynput_fallback:
+            logger.info("pynput fallback disabled by configuration")
 
         logger.warning("未能启动可用的键盘监听后端")
 

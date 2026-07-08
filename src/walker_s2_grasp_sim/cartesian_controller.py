@@ -7,6 +7,16 @@ class WalkerS2CartesianController:
     """Persistent dual-arm IK controller for manual Cartesian teleoperation."""
 
     SMOOTH_ALPHA = 0.3
+    IK_KWARGS = {
+        "max_iter": 220,
+        "pos_tol": 0.012,
+        "rot_tol": 0.08,
+        "rot_weight": 0.35,
+        "null_weight": 0.02,
+        "dq_max": 0.35,
+    }
+    USABLE_POS_ERR = 0.035
+    USABLE_ROT_ERR = 0.35
 
     def __init__(self, urdf_path, dof_names, ready_positions):
         from Ubtech_sim.source.DualArmIK import DualArmIK
@@ -57,6 +67,7 @@ class WalkerS2CartesianController:
             right_target_xyzrpy=target_xyzrpy.get("right"),
             isaac_joint_names=self.dof_names,
             isaac_joint_positions=joint_positions,
+            **self.IK_KWARGS,
         )
         q = np.asarray(joint_positions, dtype=float).copy()
         status = {}
@@ -68,5 +79,13 @@ class WalkerS2CartesianController:
             self.last_arm_positions[side] = smoothed.copy()
             for name, value in zip(names, smoothed):
                 q[self.name_to_index[name]] = float(value)
-            status[side] = bool(result.get(f"{side}_success", False))
+            status[side] = bool(result.get(f"{side}_success", False)) or self._last_result_is_usable(side)
         return q, status
+
+    def _last_result_is_usable(self, side: str) -> bool:
+        fail_info = getattr(self.ik, "_last_fail_info", {})
+        return (
+            fail_info.get("side") == side
+            and fail_info.get("pos_err", float("inf")) < self.USABLE_POS_ERR
+            and fail_info.get("rot_err", float("inf")) < self.USABLE_ROT_ERR
+        )

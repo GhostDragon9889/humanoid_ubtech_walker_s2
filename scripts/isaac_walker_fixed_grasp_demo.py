@@ -27,6 +27,7 @@ import threading
 import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -267,18 +268,43 @@ def import_isaac_modules(headless: bool):
     except Exception:
         from omni.isaac.core.utils.extensions import enable_extension
 
-    # Extension name changed across Isaac Sim versions. Try both.
-    for ext in ("isaacsim.asset.importer.urdf", "omni.isaac.urdf"):
+    urdf_api = SimpleNamespace(_urdf=None, URDFImporter=None, URDFImporterConfig=None)
+
+    # Isaac Sim 6.x ships the URDF importer as isaacsim.asset.importer.urdf.
+    # Do not also enable omni.isaac.urdf when this succeeds: that legacy
+    # extension is absent in Isaac Sim 6.x and Kit logs a dependency-resolution
+    # error before raising.
+    try:
+        enable_extension("isaacsim.asset.importer.urdf")
+        sim_app.update()
+        from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
+
+        urdf_api.URDFImporter = URDFImporter
+        urdf_api.URDFImporterConfig = URDFImporterConfig
+
         try:
-            enable_extension(ext)
+            from isaacsim.asset.importer.urdf import _urdf
+
+            urdf_api._urdf = _urdf
         except Exception:
             pass
-    sim_app.update()
-
-    try:
-        from isaacsim.asset.importer.urdf import _urdf
     except Exception:
-        from omni.isaac.urdf import _urdf
+        pass
+
+    # Older Isaac Sim releases used omni.isaac.urdf. Only attempt this fallback
+    # when the Isaac Sim 6.x importer was not available, which avoids noisy
+    # "No versions of omni.isaac.urdf" errors on 6.0.1.
+    if urdf_api.URDFImporter is None and urdf_api._urdf is None:
+        try:
+            enable_extension("omni.isaac.urdf")
+            sim_app.update()
+            from omni.isaac.urdf import _urdf
+
+            urdf_api._urdf = _urdf
+        except Exception:
+            pass
+    if urdf_api.URDFImporter is None and urdf_api._urdf is None:
+        raise RuntimeError("Could not import an Isaac Sim URDF importer API")
 
     try:
         from isaacsim.core.api import World
@@ -304,11 +330,23 @@ def import_isaac_modules(headless: bool):
     import omni.usd
     from pxr import Gf, UsdGeom
 
-    return sim_app, _urdf, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom
+    return sim_app, urdf_api, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom
 
 
-def make_import_config(_urdf):
-    cfg = _urdf.ImportConfig()
+def _set_if_supported(obj, attr: str, value):
+    if not hasattr(obj, attr):
+        return
+    try:
+        setattr(obj, attr, value)
+    except Exception:
+        pass
+
+
+def make_import_config(urdf_api):
+    if urdf_api._urdf is None:
+        return SimpleNamespace(api="importer6")
+
+    cfg = urdf_api._urdf.ImportConfig()
     # Key safety settings for this humanoid test.
     cfg.fix_base = True
     cfg.self_collision = False
@@ -331,6 +369,57 @@ def make_import_config(_urdf):
             except Exception:
                 pass
     return cfg
+
+
+def make_isaac6_importer_config(urdf_path: Path, urdf_api):
+    """Create an Isaac Sim 6.x URDFImporterConfig without assuming every field exists."""
+    output_dir = urdf_path.with_name(f"{urdf_path.stem}_isaacsim6_usd")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    usd_path = output_dir / f"{urdf_path.stem}.usd"
+    kwargs = {
+        "urdf_path": str(urdf_path),
+        "usd_path": str(usd_path),
+        "collision_from_visuals": False,
+        "merge_mesh": False,
+        "allow_self_collision": False,
+        "fix_base": True,
+    }
+    try:
+        cfg = urdf_api.URDFImporterConfig(**kwargs)
+    except TypeError:
+        cfg = urdf_api.URDFImporterConfig()
+        for attr, value in kwargs.items():
+            _set_if_supported(cfg, attr, value)
+
+    # Isaac Sim 6.0/6.0.1 moved URDF import to URDFImporter/URDFImporterConfig.
+    # Keep these assignments guarded because field names changed between preview
+    # and release builds.
+    for attr, value in {
+        "fix_base": True,
+        "merge_fixed_joints": False,
+        "collision_from_visuals": False,
+        "collision_type": "Convex Hull",
+        "link_density": 0.0,
+        "robot_type": "Humanoid",
+        "run_asset_transformer": True,
+        "run_multi_physics_conversion": True,
+        "debug_mode": False,
+    }.items():
+        _set_if_supported(cfg, attr, value)
+    return cfg
+
+
+def find_articulation_root_prim_path(stage, root_path: str) -> str:
+    root = stage.GetPrimAtPath(root_path)
+    if not root.IsValid():
+        raise RuntimeError(f"Imported robot root prim not found: {root_path}")
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path == root_path or not prim_path.startswith(f"{root_path}/"):
+            continue
+        if any("ArticulationRootAPI" in schema for schema in prim.GetAppliedSchemas()):
+            return prim_path
+    return root_path
 
 
 def tune_urdf_model_drives(robot_model):
@@ -356,6 +445,9 @@ def tune_urdf_model_drives(robot_model):
 
 
 def import_robot(urdf_path: Path, cfg, omni):
+    if getattr(cfg, "api", "") == "importer6":
+        raise RuntimeError("Internal error: Isaac Sim 6 importer config was not initialized")
+
     result, robot_model = omni.kit.commands.execute(
         "URDFParseFile", urdf_path=str(urdf_path), import_config=cfg
     )
@@ -370,6 +462,25 @@ def import_robot(urdf_path: Path, cfg, omni):
     if not result:
         raise RuntimeError("URDFImportRobot failed")
     return str(prim_path)
+
+
+def import_robot_isaac6(urdf_path: Path, urdf_api, omni) -> str:
+    cfg = make_isaac6_importer_config(urdf_path, urdf_api)
+    output_path = urdf_api.URDFImporter(cfg).import_urdf()
+    if not output_path:
+        raise RuntimeError(f"URDFImporter.import_urdf failed: {urdf_path}")
+
+    stage = omni.usd.get_context().get_stage()
+    root_name = Path(output_path).stem.replace("-", "_").replace(" ", "_")
+    root_path = f"/World/{root_name}"
+    if stage.GetPrimAtPath(root_path).IsValid():
+        suffix = 1
+        while stage.GetPrimAtPath(f"{root_path}_{suffix}").IsValid():
+            suffix += 1
+        root_path = f"{root_path}_{suffix}"
+
+    stage.DefinePrim(root_path, "Xform").GetReferences().AddReference(str(output_path))
+    return find_articulation_root_prim_path(stage, root_path)
 
 
 def set_prim_pose(stage, UsdGeom, Gf, prim_path: str, xyz, rpy_deg):
@@ -1070,14 +1181,17 @@ def main():
         urdf_for_import = simplify_hand_collisions(input_urdf, show_debug=args.show_hand_colliders)
         print(f"[INFO] Wrote simplified-hand-collision URDF: {urdf_for_import}")
 
-    sim_app, _urdf, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom = import_isaac_modules(args.headless)
+    sim_app, urdf_api, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom = import_isaac_modules(args.headless)
 
     world = World(stage_units_in_meters=1.0)
     world.scene.add_default_ground_plane()
     stage = omni.usd.get_context().get_stage()
 
-    cfg = make_import_config(_urdf)
-    prim_path = import_robot(urdf_for_import, cfg, omni)
+    if urdf_api.URDFImporter is not None:
+        prim_path = import_robot_isaac6(urdf_for_import, urdf_api, omni)
+    else:
+        cfg = make_import_config(urdf_api)
+        prim_path = import_robot(urdf_for_import, cfg, omni)
     print(f"[INFO] Imported robot at prim: {prim_path}")
 
     # Put pelvis/base_link around 0.86 m above world, so feet are approximately on the ground.
@@ -1150,12 +1264,36 @@ def main():
     if len(q_home) != len(dof_names):
         q_home = np.zeros(len(dof_names), dtype=float)
 
+    def resolve_dof_name(name):
+        if name in name_to_i:
+            return name
+        aliases = []
+        for prefix in ("hand3_v1_right_", "hand3_v1_left_"):
+            if name.startswith(prefix):
+                aliases.append(name[len(prefix) :])
+        aliases.append(name.split("/")[-1])
+
+        for alias in aliases:
+            if alias in name_to_i:
+                return alias
+
+        suffix_matches = []
+        for alias in aliases:
+            suffix_matches.extend([candidate for candidate in dof_names if candidate.endswith(alias)])
+        suffix_matches = list(dict.fromkeys(suffix_matches))
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        if len(suffix_matches) > 1:
+            print(f"[WARN] Ambiguous joint alias for {name}: {suffix_matches}")
+        return None
+
     def set_named(q, values):
         q = np.array(q, dtype=float).copy()
         missing = []
         for n, v in values.items():
-            if n in name_to_i:
-                q[name_to_i[n]] = float(v)
+            resolved = resolve_dof_name(n)
+            if resolved is not None:
+                q[name_to_i[resolved]] = float(v)
             else:
                 missing.append(n)
         if missing:
@@ -1282,14 +1420,43 @@ def main():
         (1.0, 0.0, 1.0),
         axis_length=0.10,
     )
-    right_hand_joint_names = list(right_hand_open.keys())
-    right_hand_indices = np.array([name_to_i[n] for n in right_hand_joint_names], dtype=int)
-    right_hand_open_pos = np.array([right_hand_open[n] for n in right_hand_joint_names], dtype=float)
-    right_hand_close_pos = np.array([right_hand_close[n] for n in right_hand_joint_names], dtype=float)
-    left_hand_joint_names = list(left_hand_open.keys())
-    left_hand_indices = np.array([name_to_i[n] for n in left_hand_joint_names], dtype=int)
-    left_hand_open_pos = np.array([left_hand_open[n] for n in left_hand_joint_names], dtype=float)
-    left_hand_close_pos = np.array([left_hand_close[n] for n in left_hand_joint_names], dtype=float)
+
+    def build_hand_control(open_values, close_values, side):
+        indices = []
+        open_pos = []
+        close_pos = []
+        missing = []
+        resolved_names = []
+        for n in open_values:
+            resolved = resolve_dof_name(n)
+            if resolved is None:
+                missing.append(n)
+                continue
+            indices.append(name_to_i[resolved])
+            open_pos.append(open_values[n])
+            close_pos.append(close_values[n])
+            resolved_names.append(resolved)
+        if missing:
+            print(f"[WARN] Missing {side} hand joints, skipped: {missing}")
+        if not indices:
+            raise RuntimeError(f"Could not resolve any {side} hand joints from imported DOFs")
+        print(f"[INFO] Resolved {side} hand joints: {resolved_names}")
+        return (
+            np.array(indices, dtype=int),
+            np.array(open_pos, dtype=float),
+            np.array(close_pos, dtype=float),
+        )
+
+    right_hand_indices, right_hand_open_pos, right_hand_close_pos = build_hand_control(
+        right_hand_open,
+        right_hand_close,
+        "right",
+    )
+    left_hand_indices, left_hand_open_pos, left_hand_close_pos = build_hand_control(
+        left_hand_open,
+        left_hand_close,
+        "left",
+    )
     hand_control = {
         "left": (left_hand_indices, left_hand_open_pos, left_hand_close_pos),
         "right": (right_hand_indices, right_hand_open_pos, right_hand_close_pos),
@@ -1432,15 +1599,33 @@ def main():
         src_dir = baseline_dir / "src"
         if str(src_dir) not in sys.path:
             sys.path.insert(0, str(src_dir))
-        from walker_s2_grasp_sim import WalkerS2CartesianController, WalkerS2GraspKeyboard
+        from walker_s2_grasp_sim import WalkerS2CartesianController
+        from src.lerobot.teleoperators.walker_s2_keyboard import (
+            WalkerS2KeyboardTeleop,
+            WalkerS2KeyboardTeleopConfig,
+        )
 
         cartesian_controller = WalkerS2CartesianController(
             urdf_for_import,
             dof_names,
             q_ready_open,
         )
-        teleop = WalkerS2GraspKeyboard()
+        teleop = WalkerS2KeyboardTeleop(
+            WalkerS2KeyboardTeleopConfig(
+                initial_control_arm="right",
+                enable_pynput_fallback=False,
+            )
+        )
         teleop.connect()
+        teleop.enable_callback_mode()
+        teleop.enable_terminal_polling()
+
+        def disconnect_teleop():
+            try:
+                teleop.disconnect()
+            except Exception:
+                teleop.disable_terminal_polling()
+
         print("[TELEOP] W/S: X  A/D: Y  R/F: Z")
         print("[TELEOP] Y/U: roll  V/B: pitch  N/M: yaw")
         print("[TELEOP] O: switch arm  0: bimanual  K/L: open/close hand")
@@ -1450,14 +1635,24 @@ def main():
             q_command = np.asarray(q_start, dtype=float).copy()
             grasp_requested = False
             quit_requested = False
+            frame_id = 0
             while sim_app.is_running() and not grasp_requested and not quit_requested:
-                command = teleop.sample()
-                grasp_requested = command.assisted_grasp and allow_grasp
-                quit_requested = command.quit
-                if command.assisted_grasp and not allow_grasp:
+                left_delta, right_delta, left_gripper, right_gripper = teleop.get_action_numpy(frame_id)
+                keyboard_state = teleop.get_keyboard_state()
+                frame_id += 1
+
+                arm_deltas = {}
+                if np.linalg.norm(left_delta) > 1e-10:
+                    arm_deltas["left"] = left_delta
+                if np.linalg.norm(right_delta) > 1e-10:
+                    arm_deltas["right"] = right_delta
+
+                grasp_requested = bool(keyboard_state.get("assisted_grasp")) and allow_grasp
+                quit_requested = bool(keyboard_state.get("quit"))
+                if keyboard_state.get("assisted_grasp") and not allow_grasp:
                     print("[TELEOP] The object is already lifted; press H to return home or Q to quit")
 
-                if command.go_home:
+                if keyboard_state.get("go_home"):
                     q_home_start = q_command.copy()
                     for i in range(120):
                         a = (i + 1) / 120.0
@@ -1469,17 +1664,18 @@ def main():
                     print("[TELEOP] Returned to ready pose")
                     continue
 
-                q_command, ik_status = cartesian_controller.step(q_command, command.arm_deltas)
+                q_command, ik_status = cartesian_controller.step(q_command, arm_deltas)
                 if ik_status and not all(ik_status.values()):
                     now = time.monotonic()
                     if now - run_manual_teleop.last_ik_warning_time > 1.0:
                         run_manual_teleop.last_ik_warning_time = now
                         print(f"[TELEOP] IK did not fully converge: {ik_status}")
-                if abs(command.hand_delta) > 0.0:
-                    for side in command.target_sides:
+                hand_deltas = {"left": left_gripper, "right": right_gripper}
+                for side, hand_delta in hand_deltas.items():
+                    if abs(hand_delta) > 0.0:
                         indices, open_pos, close_pos = hand_control[side]
                         q_command[indices] = np.clip(
-                            q_command[indices] + command.hand_delta * (close_pos - open_pos),
+                            q_command[indices] + hand_delta * (close_pos - open_pos),
                             np.minimum(open_pos, close_pos),
                             np.maximum(open_pos, close_pos),
                         )
@@ -1495,7 +1691,7 @@ def main():
         )
 
         if quit_requested or not grasp_requested:
-            teleop.close()
+            disconnect_teleop()
             close_camera_resources()
             sim_app.close()
             return
@@ -1539,7 +1735,7 @@ def main():
         cartesian_controller.reset(q_teleop)
         print("[TELEOP] Grasp complete. Manual keyboard control remains active; press Q to quit.")
         run_manual_teleop(q_teleop, allow_grasp=False)
-        teleop.close()
+        disconnect_teleop()
     else:
         for _ in range(args.duration_after):
             apply_full_body(q_lift_closed)
