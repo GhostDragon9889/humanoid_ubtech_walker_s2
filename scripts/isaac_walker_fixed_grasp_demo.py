@@ -1599,15 +1599,21 @@ def main():
         src_dir = baseline_dir / "src"
         if str(src_dir) not in sys.path:
             sys.path.insert(0, str(src_dir))
-        from walker_s2_grasp_sim import WalkerS2CartesianController, WalkerS2GraspKeyboard
+        from walker_s2_grasp_sim import WalkerS2CartesianController
+        from src.lerobot.teleoperators.walker_s2_keyboard import (
+            WalkerS2KeyboardTeleop,
+            WalkerS2KeyboardTeleopConfig,
+        )
 
         cartesian_controller = WalkerS2CartesianController(
             urdf_for_import,
             dof_names,
             q_ready_open,
         )
-        teleop = WalkerS2GraspKeyboard()
+        teleop = WalkerS2KeyboardTeleop(WalkerS2KeyboardTeleopConfig(initial_control_arm="right"))
         teleop.connect()
+        teleop.enable_callback_mode()
+        teleop.enable_terminal_polling()
         print("[TELEOP] W/S: X  A/D: Y  R/F: Z")
         print("[TELEOP] Y/U: roll  V/B: pitch  N/M: yaw")
         print("[TELEOP] O: switch arm  0: bimanual  K/L: open/close hand")
@@ -1617,14 +1623,24 @@ def main():
             q_command = np.asarray(q_start, dtype=float).copy()
             grasp_requested = False
             quit_requested = False
+            frame_id = 0
             while sim_app.is_running() and not grasp_requested and not quit_requested:
-                command = teleop.sample()
-                grasp_requested = command.assisted_grasp and allow_grasp
-                quit_requested = command.quit
-                if command.assisted_grasp and not allow_grasp:
+                left_delta, right_delta, left_gripper, right_gripper = teleop.get_action_numpy(frame_id)
+                keyboard_state = teleop.get_keyboard_state()
+                frame_id += 1
+
+                arm_deltas = {}
+                if np.linalg.norm(left_delta) > 1e-10:
+                    arm_deltas["left"] = left_delta
+                if np.linalg.norm(right_delta) > 1e-10:
+                    arm_deltas["right"] = right_delta
+
+                grasp_requested = bool(keyboard_state.get("assisted_grasp")) and allow_grasp
+                quit_requested = bool(keyboard_state.get("quit"))
+                if keyboard_state.get("assisted_grasp") and not allow_grasp:
                     print("[TELEOP] The object is already lifted; press H to return home or Q to quit")
 
-                if command.go_home:
+                if keyboard_state.get("go_home"):
                     q_home_start = q_command.copy()
                     for i in range(120):
                         a = (i + 1) / 120.0
@@ -1636,17 +1652,18 @@ def main():
                     print("[TELEOP] Returned to ready pose")
                     continue
 
-                q_command, ik_status = cartesian_controller.step(q_command, command.arm_deltas)
+                q_command, ik_status = cartesian_controller.step(q_command, arm_deltas)
                 if ik_status and not all(ik_status.values()):
                     now = time.monotonic()
                     if now - run_manual_teleop.last_ik_warning_time > 1.0:
                         run_manual_teleop.last_ik_warning_time = now
                         print(f"[TELEOP] IK did not fully converge: {ik_status}")
-                if abs(command.hand_delta) > 0.0:
-                    for side in command.target_sides:
+                hand_deltas = {"left": left_gripper, "right": right_gripper}
+                for side, hand_delta in hand_deltas.items():
+                    if abs(hand_delta) > 0.0:
                         indices, open_pos, close_pos = hand_control[side]
                         q_command[indices] = np.clip(
-                            q_command[indices] + command.hand_delta * (close_pos - open_pos),
+                            q_command[indices] + hand_delta * (close_pos - open_pos),
                             np.minimum(open_pos, close_pos),
                             np.maximum(open_pos, close_pos),
                         )
@@ -1662,7 +1679,7 @@ def main():
         )
 
         if quit_requested or not grasp_requested:
-            teleop.close()
+            teleop.disconnect()
             close_camera_resources()
             sim_app.close()
             return
@@ -1706,7 +1723,7 @@ def main():
         cartesian_controller.reset(q_teleop)
         print("[TELEOP] Grasp complete. Manual keyboard control remains active; press Q to quit.")
         run_manual_teleop(q_teleop, allow_grasp=False)
-        teleop.close()
+        teleop.disconnect()
     else:
         for _ in range(args.duration_after):
             apply_full_body(q_lift_closed)
