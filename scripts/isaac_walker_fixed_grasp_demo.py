@@ -268,28 +268,36 @@ def import_isaac_modules(headless: bool):
     except Exception:
         from omni.isaac.core.utils.extensions import enable_extension
 
-    # Extension name changed across Isaac Sim versions. Try both.
-    for ext in ("isaacsim.asset.importer.urdf", "omni.isaac.urdf"):
-        try:
-            enable_extension(ext)
-        except Exception:
-            pass
-    sim_app.update()
-
     urdf_api = SimpleNamespace(_urdf=None, URDFImporter=None, URDFImporterConfig=None)
+
+    # Isaac Sim 6.x ships the URDF importer as isaacsim.asset.importer.urdf.
+    # Do not also enable omni.isaac.urdf when this succeeds: that legacy
+    # extension is absent in Isaac Sim 6.x and Kit logs a dependency-resolution
+    # error before raising.
     try:
+        enable_extension("isaacsim.asset.importer.urdf")
+        sim_app.update()
         from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
 
         urdf_api.URDFImporter = URDFImporter
         urdf_api.URDFImporterConfig = URDFImporterConfig
+
+        try:
+            from isaacsim.asset.importer.urdf import _urdf
+
+            urdf_api._urdf = _urdf
+        except Exception:
+            pass
     except Exception:
         pass
-    try:
-        from isaacsim.asset.importer.urdf import _urdf
 
-        urdf_api._urdf = _urdf
-    except Exception:
+    # Older Isaac Sim releases used omni.isaac.urdf. Only attempt this fallback
+    # when the Isaac Sim 6.x importer was not available, which avoids noisy
+    # "No versions of omni.isaac.urdf" errors on 6.0.1.
+    if urdf_api.URDFImporter is None and urdf_api._urdf is None:
         try:
+            enable_extension("omni.isaac.urdf")
+            sim_app.update()
             from omni.isaac.urdf import _urdf
 
             urdf_api._urdf = _urdf
