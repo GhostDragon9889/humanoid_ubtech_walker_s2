@@ -27,6 +27,7 @@ import threading
 import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -275,10 +276,27 @@ def import_isaac_modules(headless: bool):
             pass
     sim_app.update()
 
+    urdf_api = SimpleNamespace(_urdf=None, URDFImporter=None, URDFImporterConfig=None)
+    try:
+        from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
+
+        urdf_api.URDFImporter = URDFImporter
+        urdf_api.URDFImporterConfig = URDFImporterConfig
+    except Exception:
+        pass
     try:
         from isaacsim.asset.importer.urdf import _urdf
+
+        urdf_api._urdf = _urdf
     except Exception:
-        from omni.isaac.urdf import _urdf
+        try:
+            from omni.isaac.urdf import _urdf
+
+            urdf_api._urdf = _urdf
+        except Exception:
+            pass
+    if urdf_api.URDFImporter is None and urdf_api._urdf is None:
+        raise RuntimeError("Could not import an Isaac Sim URDF importer API")
 
     try:
         from isaacsim.core.api import World
@@ -304,11 +322,23 @@ def import_isaac_modules(headless: bool):
     import omni.usd
     from pxr import Gf, UsdGeom
 
-    return sim_app, _urdf, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom
+    return sim_app, urdf_api, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom
 
 
-def make_import_config(_urdf):
-    cfg = _urdf.ImportConfig()
+def _set_if_supported(obj, attr: str, value):
+    if not hasattr(obj, attr):
+        return
+    try:
+        setattr(obj, attr, value)
+    except Exception:
+        pass
+
+
+def make_import_config(urdf_api):
+    if urdf_api._urdf is None:
+        return SimpleNamespace(api="importer6")
+
+    cfg = urdf_api._urdf.ImportConfig()
     # Key safety settings for this humanoid test.
     cfg.fix_base = True
     cfg.self_collision = False
@@ -331,6 +361,57 @@ def make_import_config(_urdf):
             except Exception:
                 pass
     return cfg
+
+
+def make_isaac6_importer_config(urdf_path: Path, urdf_api):
+    """Create an Isaac Sim 6.x URDFImporterConfig without assuming every field exists."""
+    output_dir = urdf_path.with_name(f"{urdf_path.stem}_isaacsim6_usd")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    usd_path = output_dir / f"{urdf_path.stem}.usd"
+    kwargs = {
+        "urdf_path": str(urdf_path),
+        "usd_path": str(usd_path),
+        "collision_from_visuals": False,
+        "merge_mesh": False,
+        "allow_self_collision": False,
+        "fix_base": True,
+    }
+    try:
+        cfg = urdf_api.URDFImporterConfig(**kwargs)
+    except TypeError:
+        cfg = urdf_api.URDFImporterConfig()
+        for attr, value in kwargs.items():
+            _set_if_supported(cfg, attr, value)
+
+    # Isaac Sim 6.0/6.0.1 moved URDF import to URDFImporter/URDFImporterConfig.
+    # Keep these assignments guarded because field names changed between preview
+    # and release builds.
+    for attr, value in {
+        "fix_base": True,
+        "merge_fixed_joints": False,
+        "collision_from_visuals": False,
+        "collision_type": "Convex Hull",
+        "link_density": 0.0,
+        "robot_type": "Humanoid",
+        "run_asset_transformer": True,
+        "run_multi_physics_conversion": True,
+        "debug_mode": False,
+    }.items():
+        _set_if_supported(cfg, attr, value)
+    return cfg
+
+
+def find_articulation_root_prim_path(stage, root_path: str) -> str:
+    root = stage.GetPrimAtPath(root_path)
+    if not root.IsValid():
+        raise RuntimeError(f"Imported robot root prim not found: {root_path}")
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path == root_path or not prim_path.startswith(f"{root_path}/"):
+            continue
+        if any("ArticulationRootAPI" in schema for schema in prim.GetAppliedSchemas()):
+            return prim_path
+    return root_path
 
 
 def tune_urdf_model_drives(robot_model):
@@ -356,6 +437,9 @@ def tune_urdf_model_drives(robot_model):
 
 
 def import_robot(urdf_path: Path, cfg, omni):
+    if getattr(cfg, "api", "") == "importer6":
+        raise RuntimeError("Internal error: Isaac Sim 6 importer config was not initialized")
+
     result, robot_model = omni.kit.commands.execute(
         "URDFParseFile", urdf_path=str(urdf_path), import_config=cfg
     )
@@ -370,6 +454,25 @@ def import_robot(urdf_path: Path, cfg, omni):
     if not result:
         raise RuntimeError("URDFImportRobot failed")
     return str(prim_path)
+
+
+def import_robot_isaac6(urdf_path: Path, urdf_api, omni) -> str:
+    cfg = make_isaac6_importer_config(urdf_path, urdf_api)
+    output_path = urdf_api.URDFImporter(cfg).import_urdf()
+    if not output_path:
+        raise RuntimeError(f"URDFImporter.import_urdf failed: {urdf_path}")
+
+    stage = omni.usd.get_context().get_stage()
+    root_name = Path(output_path).stem.replace("-", "_").replace(" ", "_")
+    root_path = f"/World/{root_name}"
+    if stage.GetPrimAtPath(root_path).IsValid():
+        suffix = 1
+        while stage.GetPrimAtPath(f"{root_path}_{suffix}").IsValid():
+            suffix += 1
+        root_path = f"{root_path}_{suffix}"
+
+    stage.DefinePrim(root_path, "Xform").GetReferences().AddReference(str(output_path))
+    return find_articulation_root_prim_path(stage, root_path)
 
 
 def set_prim_pose(stage, UsdGeom, Gf, prim_path: str, xyz, rpy_deg):
@@ -1070,14 +1173,17 @@ def main():
         urdf_for_import = simplify_hand_collisions(input_urdf, show_debug=args.show_hand_colliders)
         print(f"[INFO] Wrote simplified-hand-collision URDF: {urdf_for_import}")
 
-    sim_app, _urdf, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom = import_isaac_modules(args.headless)
+    sim_app, urdf_api, World, DynamicCuboid, FixedCuboid, ArticulationWrapper, ArticulationAction, omni, Gf, UsdGeom = import_isaac_modules(args.headless)
 
     world = World(stage_units_in_meters=1.0)
     world.scene.add_default_ground_plane()
     stage = omni.usd.get_context().get_stage()
 
-    cfg = make_import_config(_urdf)
-    prim_path = import_robot(urdf_for_import, cfg, omni)
+    if urdf_api.URDFImporter is not None:
+        prim_path = import_robot_isaac6(urdf_for_import, urdf_api, omni)
+    else:
+        cfg = make_import_config(urdf_api)
+        prim_path = import_robot(urdf_for_import, cfg, omni)
     print(f"[INFO] Imported robot at prim: {prim_path}")
 
     # Put pelvis/base_link around 0.86 m above world, so feet are approximately on the ground.
