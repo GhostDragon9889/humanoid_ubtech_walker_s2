@@ -1610,10 +1610,22 @@ def main():
             dof_names,
             q_ready_open,
         )
-        teleop = WalkerS2KeyboardTeleop(WalkerS2KeyboardTeleopConfig(initial_control_arm="right"))
+        teleop = WalkerS2KeyboardTeleop(
+            WalkerS2KeyboardTeleopConfig(
+                initial_control_arm="right",
+                enable_pynput_fallback=False,
+            )
+        )
         teleop.connect()
         teleop.enable_callback_mode()
         teleop.enable_terminal_polling()
+
+        def disconnect_teleop():
+            try:
+                teleop.disconnect()
+            except Exception:
+                teleop.disable_terminal_polling()
+
         print("[TELEOP] W/S: X  A/D: Y  R/F: Z")
         print("[TELEOP] Y/U: roll  V/B: pitch  N/M: yaw")
         print("[TELEOP] O: switch arm  0: bimanual  K/L: open/close hand")
@@ -1679,7 +1691,7 @@ def main():
         )
 
         if quit_requested or not grasp_requested:
-            teleop.disconnect()
+            disconnect_teleop()
             close_camera_resources()
             sim_app.close()
             return
@@ -1723,7 +1735,7 @@ def main():
         cartesian_controller.reset(q_teleop)
         print("[TELEOP] Grasp complete. Manual keyboard control remains active; press Q to quit.")
         run_manual_teleop(q_teleop, allow_grasp=False)
-        teleop.disconnect()
+        disconnect_teleop()
     else:
         for _ in range(args.duration_after):
             apply_full_body(q_lift_closed)

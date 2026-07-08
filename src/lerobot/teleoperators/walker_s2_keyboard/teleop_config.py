@@ -92,6 +92,10 @@ class WalkerS2KeyboardTeleopConfig(TeleoperatorConfig):
     # evdev 输入设备路径；为空时自动扫描所有候选键盘设备
     evdev_device_path: str | None = None
 
+    # 是否在 evdev 不可用时回退到 pynput。Isaac Sim/Conda/Xorg 组合中
+    # pynput listener 偶尔会在线程回调里崩溃，因此可由调用方关闭。
+    enable_pynput_fallback: bool = True
+
     # 按键映射字典：将数字键和字母键映射到具体动作
     keymap: dict[str, str] = field(
         default_factory=lambda: {
