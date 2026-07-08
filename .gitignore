@@ -53,6 +53,7 @@ ENV/
 htmlcov/
 
 # Hugging Face / 本地下载
+.hf_cache/
 resources/
 !assets/resources/
 assets/resources/*
@@ -110,3 +111,5 @@ compute_image_quantile_stats.py
 convert_merge_env_state.py
 process_converted_part_sorting_quantiles.py
 convert_split_env_state.py
+
+recordings/

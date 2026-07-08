@@ -530,7 +530,10 @@ class LeRobotDatasetMetadata:
         target_mode_dir = stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO  # 0o777
         current = obj.root
         while current.exists():
-            os.chmod(current, target_mode_dir)
+            try:
+                os.chmod(current, target_mode_dir)
+            except PermissionError:
+                break
             if current.name == "datasets":
                 break
             parent = current.parent
@@ -1751,7 +1754,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             current = self.root
             while current.exists():
-                os.chmod(current, target_mode_dir)
+                try:
+                    os.chmod(current, target_mode_dir)
+                except PermissionError:
+                    break
                 if current.name == "datasets":
                     break
                 parent = current.parent

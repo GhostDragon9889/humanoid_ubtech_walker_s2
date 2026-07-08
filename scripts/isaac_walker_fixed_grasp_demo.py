@@ -18,7 +18,6 @@ import sys
 import os
 import math
 import queue
-import traceback
 import time
 import shutil
 import struct
@@ -46,6 +45,23 @@ def find_challenge_repo_root() -> Path:
     raise RuntimeError("Could not locate GlobalHumanoidRobotChallenge_2026_Baseline repo root")
 
 
+def ensure_repo_python_paths() -> Path:
+    baseline_dir = find_challenge_repo_root()
+    src_dir = baseline_dir / "src"
+    src_s = str(src_dir)
+    if src_s in sys.path:
+        sys.path.remove(src_s)
+    sys.path.insert(0, src_s)
+
+    # Keep the repo root available for `src.*` and `Ubtech_sim.*` imports, but
+    # do not let local folders such as `datasets/` shadow installed packages.
+    baseline_s = str(baseline_dir)
+    if baseline_s in sys.path:
+        sys.path.remove(baseline_s)
+    sys.path.append(baseline_s)
+    return baseline_dir
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--urdf", required=True, help="Absolute or relative path to the Walker S2 URDF")
@@ -57,7 +73,46 @@ def parse_args():
         type=float,
         nargs=3,
         default=(0.92, 0.20, 1.105),
-        help="Final cube center in world coordinates. This moves only the cube, not the arm.",
+        help="Cube center in world coordinates.",
+    )
+    p.add_argument(
+        "--randomize-cube",
+        action="store_true",
+        help="Randomize the cube XY position within --cube-x-range/--cube-y-range",
+    )
+    p.add_argument(
+        "--cube-x-range",
+        type=float,
+        nargs=2,
+        default=(0.88, 0.96),
+        help="World X range used when --randomize-cube is enabled",
+    )
+    p.add_argument(
+        "--cube-y-range",
+        type=float,
+        nargs=2,
+        default=(0.16, 0.24),
+        help="World Y range used when --randomize-cube is enabled",
+    )
+    p.add_argument("--random-seed", type=int, default=None, help="Optional seed for randomized scene setup")
+    p.add_argument(
+        "--container-center",
+        type=float,
+        nargs=2,
+        default=(0.62, 0.24),
+        help="Container/tray center XY position on the table",
+    )
+    p.add_argument(
+        "--container-size",
+        type=float,
+        nargs=2,
+        default=(0.28, 0.20),
+        help="Container/tray outer XY size",
+    )
+    p.add_argument(
+        "--disable-container",
+        action="store_true",
+        help="Do not create the pick-and-place container/tray",
     )
     p.add_argument(
         "--palm-tcp-offset",
@@ -125,6 +180,25 @@ def parse_args():
     p.add_argument("--pregrasp-steps", type=int, default=240, help="Number of sim steps from ready pose to pregrasp")
     p.add_argument("--approach-steps", type=int, default=180, help="Number of sim steps from pregrasp to grasp pose")
     p.add_argument("--lift-steps", type=int, default=180, help="Number of sim steps for the post-grasp lift")
+    p.add_argument("--record-dataset-root", default="", help="Record one episode to this local LeRobot dataset root")
+    p.add_argument("--record-repo-id", default="walker_s2_grasp", help="LeRobot repo_id stored in dataset metadata")
+    p.add_argument("--record-task", default="pick the block and place it in the tray", help="Task string saved with recorded frames")
+    p.add_argument("--record-fps", type=int, default=15, help="FPS metadata for recorded LeRobot episodes")
+    p.add_argument(
+        "--record-step-stride",
+        type=int,
+        default=4,
+        help="Record one frame every N sim steps; default assumes roughly 60 Hz sim -> 15 FPS recording",
+    )
+    p.add_argument(
+        "--record-start",
+        choices=("task", "launch"),
+        default="task",
+        help="When to start saving frames. 'task' starts at the automatic grasp trigger; 'launch' records teleop waiting too.",
+    )
+    p.add_argument("--replay-dataset-root", default="", help="Replay actions from this local LeRobot dataset root")
+    p.add_argument("--replay-repo-id", default="walker_s2_grasp", help="LeRobot repo_id for replay metadata")
+    p.add_argument("--replay-episode", type=int, default=0, help="Episode index to replay from the dataset")
     p.add_argument("--no-preprocess-hand-collisions", action="store_true")
     p.add_argument("--save-stage", default="", help="Optional output USD path after import")
     return p.parse_args()
@@ -534,7 +608,6 @@ def create_head_camera_sensors(camera_paths, world=None):
             print(f"[INFO] Initialized direct RGB head camera: {name}")
         except Exception as exc:
             print(f"[WARN] Direct RGB camera unavailable for {name}: {exc}")
-            traceback.print_exc()
     return sensors
 
 
@@ -895,6 +968,62 @@ def set_object_position(obj, stage, UsdGeom, Gf, prim_path: str, xyz):
         xform.AddTranslateOp().Set(Gf.Vec3d(float(xyz[0]), float(xyz[1]), float(xyz[2])))
 
 
+def set_prim_display_color(stage, UsdGeom, Gf, prim_path: str, color, opacity=1.0):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+    try:
+        gprim = UsdGeom.Gprim(prim)
+        gprim.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+        gprim.CreateDisplayOpacityAttr([float(opacity)])
+    except Exception:
+        pass
+
+
+def add_pick_place_container(
+    world,
+    stage,
+    UsdGeom,
+    Gf,
+    FixedCuboid,
+    center_xy,
+    table_top_z,
+    size_xy,
+):
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    sx, sy = float(size_xy[0]), float(size_xy[1])
+    UsdGeom.Xform.Define(stage, "/World/place_container")
+    wall_t = 0.015
+    bottom_t = 0.012
+    wall_h = 0.08
+    bottom_z = float(table_top_z) + bottom_t * 0.5
+    wall_z = float(table_top_z) + bottom_t + wall_h * 0.5
+    pieces = (
+        ("bottom", (cx, cy, bottom_z), (sx, sy, bottom_t)),
+        ("left_wall", (cx - sx * 0.5 + wall_t * 0.5, cy, wall_z), (wall_t, sy, wall_h)),
+        ("right_wall", (cx + sx * 0.5 - wall_t * 0.5, cy, wall_z), (wall_t, sy, wall_h)),
+        ("front_wall", (cx, cy + sy * 0.5 - wall_t * 0.5, wall_z), (sx, wall_t, wall_h)),
+        ("back_wall", (cx, cy - sy * 0.5 + wall_t * 0.5, wall_z), (sx, wall_t, wall_h)),
+    )
+    for name, pos, scale in pieces:
+        prim_path = f"/World/place_container/{name}"
+        world.scene.add(
+            FixedCuboid(
+                prim_path=prim_path,
+                name=f"place_container_{name}",
+                position=np.array(pos, dtype=float),
+                scale=np.array(scale, dtype=float),
+            )
+        )
+        set_prim_display_color(stage, UsdGeom, Gf, prim_path, (0.05, 0.25, 0.9), opacity=0.9)
+
+    return {
+        "center": np.array([cx, cy, float(table_top_z) + bottom_t], dtype=float),
+        "size": np.array([sx, sy], dtype=float),
+        "table_top_z": float(table_top_z),
+    }
+
+
 def rotation_z(theta):
     c = math.cos(theta)
     s = math.sin(theta)
@@ -967,7 +1096,7 @@ def solve_right_arm_to_cube(
 ):
     baseline_dir = find_challenge_repo_root()
     if str(baseline_dir) not in sys.path:
-        sys.path.insert(0, str(baseline_dir))
+        sys.path.append(str(baseline_dir))
 
     import pinocchio as pin
     from Ubtech_sim.source.DualArmIK import DualArmIK
@@ -1060,6 +1189,11 @@ def solve_right_arm_to_cube(
 
 def main():
     args = parse_args()
+    baseline_dir = ensure_repo_python_paths()
+    record_enabled = bool(args.record_dataset_root)
+    replay_enabled = bool(args.replay_dataset_root)
+    if record_enabled and replay_enabled:
+        raise ValueError("Use either --record-dataset-root or --replay-dataset-root, not both")
     input_urdf = Path(args.urdf).expanduser().resolve()
     if not input_urdf.exists():
         raise FileNotFoundError(input_urdf)
@@ -1102,23 +1236,44 @@ def main():
             f"{debug_count} boxes, visual scale={args.debug_collider_visual_scale}"
         )
 
-    # Table uses the old Part_Sorting task layout. The arm pose is fixed from this reference;
-    # changing the object pose below does not re-solve or move the arm.
+    # Table uses the old Part_Sorting task layout.
     table_center = np.array([0.75, 0.3, 1.02])
-    fixed_arm_reference_center = np.array([0.92, 0.20, 1.105], dtype=float)
+    table_size = np.array([1.2, 0.65, 0.04])
+    table_top_z = float(table_center[2] + table_size[2] * 0.5)
+    if args.randomize_cube:
+        rng = np.random.default_rng(args.random_seed)
+        task_cube_center = np.asarray(args.cube_center, dtype=float).copy()
+        task_cube_center[0] = rng.uniform(float(args.cube_x_range[0]), float(args.cube_x_range[1]))
+        task_cube_center[1] = rng.uniform(float(args.cube_y_range[0]), float(args.cube_y_range[1]))
+    else:
+        task_cube_center = np.asarray(args.cube_center, dtype=float)
+    fixed_arm_reference_center = task_cube_center.copy()
+
     world.scene.add(
         FixedCuboid(
             prim_path="/World/table",
             name="table",
             position=table_center,
-            scale=np.array([1.2, 0.65, 0.04]),
+            scale=table_size,
         )
     )
+    container_info = None
+    if not args.disable_container:
+        container_info = add_pick_place_container(
+            world,
+            stage,
+            UsdGeom,
+            Gf,
+            FixedCuboid,
+            args.container_center,
+            table_top_z,
+            args.container_size,
+        )
     cube = world.scene.add(
         DynamicCuboid(
             prim_path="/World/grasp_cube",
             name="grasp_cube",
-            position=fixed_arm_reference_center,
+            position=task_cube_center,
             scale=np.array([0.035, 0.035, 0.13]),
             mass=0.05,
         )
@@ -1299,10 +1454,13 @@ def main():
     q_lift_closed = q_lift_open.copy()
     q_lift_closed[right_hand_indices] = right_hand_close_pos
 
-    def apply_full_body_with_hand(hand_pos):
+    def full_body_with_right_hand(hand_pos):
         q = q_grasp_open.copy()
         q[right_hand_indices] = np.array(hand_pos, dtype=float)
-        robot.apply_action(ArticulationAction(joint_positions=q))
+        return q
+
+    def apply_full_body_with_hand(hand_pos):
+        apply_full_body(full_body_with_right_hand(hand_pos))
 
     def apply_full_body(q):
         robot.apply_action(ArticulationAction(joint_positions=np.array(q, dtype=float)))
@@ -1327,7 +1485,7 @@ def main():
             args.object_palm_offset,
         )
     else:
-        object_center = np.asarray(args.cube_center, dtype=float)
+        object_center = task_cube_center.copy()
     set_object_position(cube, stage, UsdGeom, Gf, "/World/grasp_cube", object_center)
 
     camera_capture_viewports = {}
@@ -1404,8 +1562,68 @@ def main():
         world.step(render=render)
         update_camera_viewer()
 
+    recorder = None
+    record_step_counter = 0
+    recording_active = args.record_start == "launch"
+    if record_enabled:
+        from walker_s2_grasp_sim import WalkerS2LeRobotRecorder
+
+        try:
+            recorder = WalkerS2LeRobotRecorder(
+                repo_id=args.record_repo_id,
+                root=args.record_dataset_root,
+                fps=args.record_fps,
+                dof_names=dof_names,
+                image_shape=(HEAD_CAMERA_HEIGHT, HEAD_CAMERA_WIDTH, 3),
+                task=args.record_task,
+            )
+        except ModuleNotFoundError as exc:
+            missing = exc.name or str(exc)
+            raise RuntimeError(
+                "Recording needs the LeRobot dataset dependencies inside Isaac Sim's Python. "
+                f"Missing module: {missing}. Install them with Isaac's python.sh before running "
+                "record_walker_grasp.sh."
+            ) from exc
+        print(f"[INFO] Recording LeRobot episode to: {recorder.root}")
+
+    def maybe_record(action_q):
+        nonlocal record_step_counter
+        if recorder is None or not recording_active:
+            return
+        record_step_counter += 1
+        if record_step_counter % max(1, int(args.record_step_stride)) != 0:
+            return
+        observation_q = get_joint_positions(robot, len(dof_names))
+        recorder.add_frame(
+            observation_state=observation_q,
+            action=action_q,
+            camera_frames=dict(camera_capture_state["frames"]),
+        )
+
+    def finish_recording():
+        if recorder is not None:
+            recorder.save()
+
+    def start_recording(reason):
+        nonlocal recording_active, record_step_counter
+        if recorder is None or recording_active:
+            return
+        recording_active = True
+        record_step_counter = 0
+        print(f"[INFO] Started recording: {reason}")
+
     print(f"[INFO] Fixed arm reference center: {fixed_arm_reference_center.tolist()}")
     print(f"[INFO] Placed cube at {object_center.tolist()}")
+    if args.randomize_cube:
+        print(
+            "[INFO] Randomized cube XY from "
+            f"x={tuple(args.cube_x_range)}, y={tuple(args.cube_y_range)}, seed={args.random_seed}"
+        )
+    if container_info is not None:
+        print(
+            "[INFO] Pick-place container center/top: "
+            f"{container_info['center'].tolist()}, size_xy={container_info['size'].tolist()}"
+        )
     print(f"[INFO] Grasp palm-normal clearance: {args.grasp_clearance:.4f} m")
     if args.object_palm_offset is not None:
         print(f"[INFO] Object palm offset: {np.asarray(args.object_palm_offset, dtype=float).tolist()}")
@@ -1424,14 +1642,30 @@ def main():
         apply_full_body(q_ready_open)
         step_world(render=render)
 
+    if replay_enabled:
+        from walker_s2_grasp_sim import WalkerS2LeRobotReplay
+
+        replay = WalkerS2LeRobotReplay(
+            repo_id=args.replay_repo_id,
+            root=args.replay_dataset_root,
+        )
+        print(
+            "[INFO] Replaying LeRobot episode "
+            f"{args.replay_episode} from: {Path(args.replay_dataset_root).expanduser()}"
+        )
+        for q_replay in replay.iter_actions(args.replay_episode):
+            if len(q_replay) != len(dof_names):
+                raise ValueError(
+                    f"Replay action has {len(q_replay)} DOFs, current robot has {len(dof_names)}"
+                )
+            apply_full_body(q_replay)
+            step_world(render=render)
+        close_camera_resources()
+        sim_app.close()
+        return
+
     q_teleop = q_ready_open.copy()
     if render:
-        baseline_dir = find_challenge_repo_root()
-        if str(baseline_dir) not in sys.path:
-            sys.path.insert(0, str(baseline_dir))
-        src_dir = baseline_dir / "src"
-        if str(src_dir) not in sys.path:
-            sys.path.insert(0, str(src_dir))
         from walker_s2_grasp_sim import WalkerS2CartesianController, WalkerS2GraspKeyboard
 
         cartesian_controller = WalkerS2CartesianController(
@@ -1465,6 +1699,7 @@ def main():
                         q_command = (1.0 - s) * q_home_start + s * q_ready_open
                         apply_full_body(q_command)
                         step_world(render=True)
+                        maybe_record(q_command)
                     cartesian_controller.reset(q_command)
                     print("[TELEOP] Returned to ready pose")
                     continue
@@ -1486,6 +1721,7 @@ def main():
 
                 apply_full_body(q_command)
                 step_world(render=True)
+                maybe_record(q_command)
             return q_command, grasp_requested, quit_requested
         run_manual_teleop.last_ik_warning_time = 0.0
 
@@ -1496,11 +1732,14 @@ def main():
 
         if quit_requested or not grasp_requested:
             teleop.close()
+            finish_recording()
             close_camera_resources()
             sim_app.close()
             return
     else:
         print("[INFO] Headless mode: starting the automatic grasp immediately.")
+
+    start_recording("automatic grasp motion")
 
     print(f"[INFO] Moving from ready pose to pregrasp ({args.pregrasp_distance:.3f} m clearance).")
     for i in range(args.pregrasp_steps):
@@ -1509,6 +1748,7 @@ def main():
         q = (1.0 - s) * q_teleop + s * q_pregrasp_open
         apply_full_body(q)
         step_world(render=render)
+        maybe_record(q)
 
     print("[INFO] Approaching from pregrasp to grasp pose.")
     for i in range(args.approach_steps):
@@ -1517,14 +1757,17 @@ def main():
         q = (1.0 - s) * q_pregrasp_open + s * q_grasp_open
         apply_full_body(q)
         step_world(render=render)
+        maybe_record(q)
 
     print("[INFO] Closing hand.")
     for i in range(240):
         a = (i + 1) / 240.0
         s = a * a * (3.0 - 2.0 * a)
         hand_q = (1.0 - s) * right_hand_open_pos + s * right_hand_close_pos
-        apply_full_body_with_hand(hand_q)
+        q = full_body_with_right_hand(hand_q)
+        apply_full_body(q)
         step_world(render=render)
+        maybe_record(q)
 
     print(f"[INFO] Lifting closed grasp by {args.lift_height:.3f} m.")
     for i in range(args.lift_steps):
@@ -1533,6 +1776,7 @@ def main():
         q = (1.0 - s) * q_grasp_closed + s * q_lift_closed
         apply_full_body(q)
         step_world(render=render)
+        maybe_record(q)
 
     if render:
         q_teleop = q_lift_closed.copy()
@@ -1544,8 +1788,10 @@ def main():
         for _ in range(args.duration_after):
             apply_full_body(q_lift_closed)
             step_world(render=False)
+            maybe_record(q_lift_closed)
 
     print("[INFO] Done. Tune --object-palm-offset if the cube is not in the palm contact area.")
+    finish_recording()
     close_camera_resources()
     sim_app.close()
 
